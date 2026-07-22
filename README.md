@@ -18,7 +18,43 @@
 - Claude Code、Codex 的 hooks、MCP、Skills 安装器；通用 Agent 可使用 MCP、HTTP 或 hook wrapper。
 - 本地管理命令：检查、策略审批/撤销、遗忘、加密导入导出、重建索引和健康检查。
 
-它不是云同步服务、完整语义向量数据库、多用户服务，也不是一个能够自动理解所有事实和策略违规的通用裁判。详见“[MVP 边界](#mvp-边界)”。
+它不是云同步服务、完整语义向量数据库、多用户服务，也不是一个能够自动理解所有事实和策略违规的通用裁判。详见“[设计覆盖与实现状态](#设计覆盖与实现状态)”和“[MVP 边界](#mvp-边界)”。
+
+## 设计覆盖与实现状态
+
+以下状态对照 [记忆架构.md](记忆架构.md) 与 [记忆架构讨论原文.md](记忆架构讨论原文.md) 核查当前 `0.1.0` 实现。结论是：**在线快速控制层基本落地，慢速学习层主要停留在候选聚类、存储模型和人工审批。**
+
+### 已实现
+
+| 设计 | 当前实现 |
+|---|---|
+| Feature Extractor | [src/core/features.ts](src/core/features.ts) 的 `extractFeatures()` 提取 `hasImage`、`taskType`、`entitiesCount` 等特征；`compressedClassifierFeatures()` 只向可选分类器发送隐私压缩投影。 |
+| Risk Recognizer 两级架构 | [src/core/risk.ts](src/core/risk.ts) 提供 8 类确定性风险规则和 `RiskClassifier` 接口，[HTTP classifier](src/providers/http-risk-classifier.ts) 提供可插拔实现；每个风险码取规则、分类器与 calibration 贡献的最大值。 |
+| Cognitive Mode Controller | [src/core/mode.ts](src/core/mode.ts) 分级控制 `evidenceFirst`、`uncertainty`、`retrieveOriginalSource`、`askClarification` 和 `narrativeCompletionGate`，并在 `TurnPlan.retrievalStages` 中声明检索顺序及 checkpoint 门。 |
+| 模式控制后的 Memory Retrieval | [src/runtime.ts](src/runtime.ts) 通过 `beginTurn()` → `checkpointEvidence()` → `recall()` 串起在线链路；未满足证据门时，服务端以 `STAGE_BLOCKED` 拒绝领域记忆召回。 |
+| 纠错归因、聚类与晋升阈值 | `submitCorrection()` 将显式事实写入 World Memory，并把并发冲突标为 `disputed`；行为纠错由 `recordCandidateCluster()` 聚类，至少 3 次独立纠错、覆盖 2 个 session 后仍需人工 `memoryctl approve`。 |
+| Verifier | [src/core/verifier.ts](src/core/verifier.ts) 汇总证据覆盖、冲突、Policy 违规和 unsupported claim，并检测少量“无证据声称记忆”的中英文表达；失败最多重试一次，之后 `clarify` 或 `abstain`。 |
+| Episode 原始来源 | `createEpisode()` 保存用于定位的 title/summary，同时用 `eventRefs` 指向权威 SourceEvent；`memory_get_sources` 可按经过授权的 SourceRef 展开脱敏原文，摘要不会替代来源。 |
+| Counterexample | 行为纠错持久化 `wrongStatement` 和来源；`recall()` 会在 MemoryBundle 中附带当前作用域最近最多 10 条行为纠错作为反例。 |
+
+### 部分实现
+
+- **Self Calibration Profile**：`calibration_patterns` 已有表、CRUD 和按完整 Agent profile 隔离的消费端，`beginTurn()` 会把活动 pattern 叠加到风险概率；但没有纠错驱动的自动写入、训练、历史回放或 shadow 发布流程。
+- **混合检索**：当前只有 FTS5/BM25、scope ACL 和 SourceRef 展开；embedding、实体图、时间邻近和线程邻近融合尚未接入，相关表仅为未来能力预留。
+- **三层记忆**：World、Episode、Policy 模型均已存在，Policy 支持 user/workspace/session 作用域；但 session Policy 不会在对话结束时自动清除，World Memory 也没有实体图遍历。
+- **Episode 切块**：当前每个成功完成的 turn 生成一个 Episode，不按人物首次出现、纠错或情绪转折等叙事边界切分；summary 是最终回答的前 400 个字符。
+- **快慢双轨**：风险识别、模式切换、门控检索和验证构成快速在线层；慢速层只有纠错聚类、候选 Policy 和人工审批，没有独立离线分析进程。
+
+### 未实现
+
+- **Trigger 运行时与自动学习**：只有持久表和库级 CRUD；Trigger 尚未参与风险识别、Policy 激活或检索，激活频率衰减和从重复纠错自动生成 Trigger 也未实现。
+- **Policy 分层和依赖调度**：没有 L1/L2/L3/Archive 调度、Dependency 加载或 Policy Graph。按最终设计，Policy 本体保持不衰减；缺失的是 Trigger activation-frequency decay 与条件重新出现时的自动激活。
+- **Re-experience pack 工作集**：尚不能自动组合近期 20–50 轮原文、完整历史片段、关键事件、情绪片段和事实约束表。
+- **聚类后更新 Risk Recognizer**：FailureCluster 不会自动生成或发布新的风险模式；候选仍需要人工审查和审批。
+- **按风险模式动态选择检索策略**：检索 stage 顺序基本固定，尚无 `entity_merge → 精确名称 → 时间线 → 关系图` 等按风险切换的策略表。
+- **检索后重排序与证据覆盖排序**：`sourceCoverage` 目前是报告指标，不参与候选重排或返回顺序。
+
+**一句话总结：**“危险识别 → 模式切换 → 门控检索 → 验证 → 纠错入口”这条在线主链路已经贯通；Calibration 自更新、Trigger、Policy 分层调度、混合检索和工作集重建等慢速元认知闭环仍依赖后续实现与人工 CLI 审批。
 
 ## 运行结构
 
@@ -198,11 +234,9 @@ hook 无法连接 daemon 时会允许 Agent 继续工作，并在 SessionStart/U
 当前没有实现：
 
 - 连续或云端同步、设备间冲突合并、workspace identity 重映射；只有加密导入导出和 tombstone。
-- embedding provider、向量召回或已投入使用的实体图召回；当前检索是 FTS5/BM25。
 - 后台持续 replay、退避调度和损坏 hook spool 的自动隔离；当前只在 SessionStart 或显式 CLI 调用时顺序重放。
 - 从任意对话自动抽取事实；事实和策略主要来自显式 correction，Episode 在成功完成 turn 后生成。
 - 完整语义 verifier。内置 verifier 会检测少量“声称记得但没有证据”的表达，并合并外部 `verifierResult` 报告的问题；外部状态只能收紧结果，不能用 `pass` 绕过 deterministic floor。
-- 自动把候选行为规则晋升为活动 Policy。非显式行为纠错会形成 candidate 和 failure cluster；达到 3 个独立纠错/2 个 session 后，仍必须由人审查其非实体特定性并运行 `memoryctl approve`。
 - 强隔离的多用户服务、远程 TLS、密钥轮换和后台备份。
 
 导入是可重复的记录级过程，但不是跨设备持续同步，也不是全包原子事务。tombstone 优先，已有同 ID 不同内容会报告冲突而不是覆盖。workspace ID 依赖本地主密钥；跨设备希望自然命中相同 workspace 时，需要保持一致的主密钥/身份配置。
