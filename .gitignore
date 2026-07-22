@@ -1,0 +1,9 @@
+node_modules/
+dist/
+coverage/
+.memoryd/
+*.db
+*.db-shm
+*.db-wal
+*.log
+.DS_Store

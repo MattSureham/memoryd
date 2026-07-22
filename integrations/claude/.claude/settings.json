@@ -1,0 +1,41 @@
+{
+  "autoMemoryEnabled": false,
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [{ "type": "command", "command": "memoryctl hook claude session-start" }]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [{ "type": "command", "command": "memoryctl hook claude user-prompt" }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [{ "type": "command", "command": "memoryctl hook claude post-tool" }]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [{ "type": "command", "command": "memoryctl hook claude pre-compact" }]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [{ "type": "command", "command": "memoryctl hook claude post-compact" }]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [{ "type": "command", "command": "memoryctl hook claude stop" }]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [{ "type": "command", "command": "memoryctl hook claude session-end" }]
+      }
+    ]
+  }
+}

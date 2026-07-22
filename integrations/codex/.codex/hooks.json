@@ -1,0 +1,39 @@
+{
+  "description": "Risk-aware shared-memory lifecycle adapter.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [{ "type": "command", "command": "memoryctl hook codex session-start" }]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [{ "type": "command", "command": "memoryctl hook codex user-prompt" }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|apply_patch|Edit|Write|mcp__.*",
+        "hooks": [{ "type": "command", "command": "memoryctl hook codex post-tool" }]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [{ "type": "command", "command": "memoryctl hook codex pre-compact" }]
+      }
+    ],
+    "PostCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [{ "type": "command", "command": "memoryctl hook codex post-compact" }]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [{ "type": "command", "command": "memoryctl hook codex stop" }]
+      }
+    ]
+  }
+}

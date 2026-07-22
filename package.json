@@ -1,0 +1,69 @@
+{
+  "name": "agent-memory-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A local-first, risk-aware memory runtime for Claude Code, Codex, and other agents.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MattSureham/long-term-mem.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MattSureham/long-term-mem/issues"
+  },
+  "homepage": "https://github.com/MattSureham/long-term-mem#readme",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js"
+    },
+    "./contracts": {
+      "types": "./dist/contracts.d.ts",
+      "import": "./dist/contracts.js"
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "memoryd": "./dist/daemon.js",
+    "memoryctl": "./dist/cli.js",
+    "memory-mcp": "./dist/mcp/server.js"
+  },
+  "files": [
+    "dist",
+    "integrations",
+    "schemas",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepack": "pnpm build",
+    "dev": "tsx src/daemon.ts",
+    "mcp": "tsx src/mcp/server.ts",
+    "cli": "tsx src/cli.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "bench": "tsx scripts/benchmark.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "better-sqlite3": "^13.0.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.20.1",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  },
+  "packageManager": "pnpm@10.15.1"
+}

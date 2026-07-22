@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "memoryd": {
+      "type": "stdio",
+      "command": "memory-mcp"
+    }
+  }
+}

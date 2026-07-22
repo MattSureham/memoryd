@@ -1,0 +1,13 @@
+[features]
+memories = false
+hooks = true
+
+[memories]
+generate_memories = false
+use_memories = false
+
+[mcp_servers.memoryd]
+command = "memory-mcp"
+required = true
+startup_timeout_sec = 10.0
+tool_timeout_sec = 30.0
