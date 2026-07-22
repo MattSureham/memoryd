@@ -1,8 +1,9 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
 import {
+  PROTOCOL_VERSION,
   ProtocolError,
   type AgentProfile,
   type CorrectionInput,
@@ -36,11 +37,18 @@ import type {
   ImportOptions,
   ImportResult,
   MemoryStoreOptions,
+  LearningJobRecord,
+  LearningJobType,
+  OwnerMetadata,
   PolicyApprovalEligibility,
   ReindexResult,
+  EntityOwnerHit,
   SearchHit,
   SearchKind,
   SearchOptions,
+  SourceEventListOptions,
+  StoredEmbedding,
+  SessionLifecycleRecord,
   StorageSearchResult,
   StoredCorrection,
   StoredObservation,
@@ -49,6 +57,7 @@ import type {
   StoredTurn,
   StoreHealth,
   TriggerRecord,
+  TriggerActivationRecord,
   TurnUpdate,
 } from "./types.js";
 
@@ -83,6 +92,8 @@ interface ExportPackage {
     triggers: TriggerRecord[];
     failureClusters: FailureClusterRecord[];
     calibrationPatterns: CalibrationPatternRecord[];
+    sessions: SessionLifecycleRecord[];
+    triggerActivations: TriggerActivationRecord[];
     tombstones: Array<Record<string, unknown>>;
   };
 }
@@ -218,6 +229,13 @@ export class MemoryStore {
       return existing;
     }
 
+    if (this.hasTombstone("session", args.scope.sessionId)) {
+      this.versionConflict(`Session ${args.scope.sessionId} has been forgotten and cannot be reused`);
+    }
+    if (this.isSessionEnded(args.scope)) {
+      this.versionConflict(`Session ${args.scope.sessionId} has ended and no longer accepts events`);
+    }
+
     const eventId = args.input.eventId ?? randomUUID();
     const existingById = this.getSourceEvent(eventId);
     if (existingById) {
@@ -315,6 +333,34 @@ export class MemoryStore {
     });
   }
 
+  listSourceEvents(scope: ScopeRef, options: SourceEventListOptions = {}): SourceEvent[] {
+    const maxRevision = Math.min(options.maxRevision ?? this.getRevision(), this.getRevision());
+    const limit = Math.max(1, Math.min(options.limit ?? 200, 5_000));
+    const kinds = options.kinds ?? [];
+    if (kinds.length > 0) {
+      const positionalRows = this.database.prepare(`
+        SELECT * FROM source_events
+        WHERE ${this.aclSql(false)} AND revision <= @maxRevision
+          AND kind IN (${kinds.map((_, index) => `@kind${index}`).join(", ")})
+        ORDER BY occurred_at DESC, revision DESC, event_id DESC
+        LIMIT @limit
+      `).all({
+        ...this.aclParams(scope),
+        maxRevision,
+        limit,
+        ...Object.fromEntries(kinds.map((kind, index) => [`kind${index}`, kind])),
+      }) as Row[];
+      return positionalRows.map((row) => this.decodeSourceEvent(row));
+    }
+    const rows = this.database.prepare(`
+      SELECT * FROM source_events
+      WHERE ${this.aclSql(false)} AND revision <= @maxRevision
+      ORDER BY occurred_at DESC, revision DESC, event_id DESC
+      LIMIT @limit
+    `).all({ ...this.aclParams(scope), maxRevision, limit }) as Row[];
+    return rows.map((row) => this.decodeSourceEvent(row));
+  }
+
   getSources(refs: readonly SourceRef[], scope?: ScopeRef): SourceEvent[] {
     return this.getSourceEvents(refs, scope);
   }
@@ -399,6 +445,102 @@ export class MemoryStore {
     if (!row) return undefined;
     if (scope) this.assertAcl(row, scope, true);
     return this.decodeTurn(row);
+  }
+
+  ensureSession(scope: ScopeRef & { sessionId: string }, startedAt = this.isoNow()): SessionLifecycleRecord {
+    this.requireWritable();
+    const existing = this.getSession(scope.sessionId, scope);
+    if (existing !== undefined) return existing;
+    this.assertNotTombstoned("session", scope.sessionId);
+    return this.database.transaction(() => {
+      const revision = this.nextRevision();
+      const record: SessionLifecycleRecord = {
+        scope,
+        status: "active",
+        startedAt,
+        revision,
+      };
+      this.database.prepare(`
+        INSERT INTO session_lifecycle(
+          session_id, revision, user_id, workspace_id, status, started_at,
+          ended_at, end_idempotency_key, record_hash
+        ) VALUES (?, ?, ?, ?, 'active', ?, NULL, NULL, ?)
+      `).run(
+        scope.sessionId,
+        revision,
+        scope.userId,
+        scope.workspaceId ?? null,
+        startedAt,
+        sha256(canonicalJson(record)),
+      );
+      return record;
+    })();
+  }
+
+  getSession(sessionId: string, scope?: ScopeRef): SessionLifecycleRecord | undefined {
+    const row = this.database.prepare("SELECT * FROM session_lifecycle WHERE session_id = ?").get(sessionId) as Row | undefined;
+    if (row === undefined) return undefined;
+    if (scope !== undefined) this.assertAcl(row, scope, false);
+    const record: SessionLifecycleRecord = {
+      scope: {
+        ...this.scopeFromRow(row),
+        sessionId,
+      },
+      status: String(row.status) as SessionLifecycleRecord["status"],
+      startedAt: String(row.started_at),
+      revision: Number(row.revision),
+    };
+    if (typeof row.ended_at === "string") record.endedAt = row.ended_at;
+    if (typeof row.end_idempotency_key === "string") record.endIdempotencyKey = row.end_idempotency_key;
+    return record;
+  }
+
+  endSession(
+    scope: ScopeRef & { sessionId: string },
+    idempotencyKey: string,
+    endedAt = this.isoNow(),
+  ): SessionLifecycleRecord {
+    this.requireWritable();
+    const existing = this.getSession(scope.sessionId, scope);
+    if (existing?.status === "ended") return existing;
+    const started = existing ?? this.ensureSession(scope, endedAt);
+    return this.database.transaction(() => {
+      const revision = this.nextRevision();
+      const record: SessionLifecycleRecord = {
+        ...started,
+        scope,
+        status: "ended",
+        endedAt,
+        endIdempotencyKey: idempotencyKey,
+        revision,
+      };
+      this.database.prepare(`
+        UPDATE session_lifecycle SET revision = ?, status = 'ended', ended_at = ?,
+          end_idempotency_key = ?, record_hash = ? WHERE session_id = ?
+      `).run(revision, endedAt, idempotencyKey, sha256(canonicalJson(record)), scope.sessionId);
+      return record;
+    })();
+  }
+
+  isSessionEnded(scope: ScopeRef & { sessionId: string }): boolean {
+    return this.getSession(scope.sessionId, scope)?.status === "ended";
+  }
+
+  listTurns(
+    scope: ScopeRef,
+    options: { includeAllSessions?: boolean; maxRevision?: number; limit?: number } = {},
+  ): StoredTurn[] {
+    const rows = this.database.prepare(`
+      SELECT * FROM turns
+      WHERE ${this.aclSql(!options.includeAllSessions)} AND revision <= @maxRevision
+      ORDER BY created_at DESC, revision DESC, turn_id DESC
+      LIMIT @limit
+    `).all({
+      ...this.aclParams(scope),
+      maxRevision: Math.min(options.maxRevision ?? this.getRevision(), this.getRevision()),
+      limit: Math.max(1, Math.min(options.limit ?? 100, 2_000)),
+    }) as Row[];
+    return rows.map((row) => this.decodeTurn(row));
   }
 
   updateTurn(turnId: string, patch: TurnUpdate): StoredTurn {
@@ -746,7 +888,8 @@ export class MemoryStore {
   }
 
   getActivePolicies(scope: ScopeRef): StoredPolicy[] {
-    return this.listPolicies(scope, false);
+    const ended = scope.sessionId === undefined ? false : this.isSessionEnded(scope as ScopeRef & { sessionId: string });
+    return this.listPolicies(scope, false).filter((policy) => !ended || policy.scopeLevel !== "session");
   }
 
   policyApprovalEligibility(policyId: string): PolicyApprovalEligibility {
@@ -842,12 +985,61 @@ export class MemoryStore {
         sanitized.scope.userId,
         sanitized.scope.workspaceId ?? null,
         sanitized.title,
-        sanitized.summary ?? "",
+        this.episodeSearchableSummary(sanitized),
       );
       this.linkSources("episode", sanitized.episodeId, sanitized.eventRefs);
       if (idempotencyKey) {
         this.rememberIdempotency("put_episode", idempotencyKey, sanitized.episodeId, requestHash, revision);
       }
+      this.touchIndex(revision);
+      return sanitized;
+    })();
+  }
+
+  /** Episodes are rebuildable narrative indexes; extending a chunk never mutates SourceEvent history. */
+  updateEpisode(episode: EpisodeMemory): EpisodeMemory {
+    this.requireWritable();
+    const sanitized = redactSensitiveValue(episode).value;
+    if (sanitized.eventRefs.length === 0) {
+      throw new ProtocolError({ code: "INVALID_REQUEST", message: "Episodes require SourceRefs" });
+    }
+    this.assertSourceRefs(sanitized.eventRefs, sanitized.scope);
+    const existing = this.getEpisode(sanitized.episodeId, sanitized.scope);
+    if (existing === undefined) this.notFound(`Episode ${sanitized.episodeId} was not found`);
+    const recordHash = sha256(canonicalJson(sanitized));
+    if (sha256(canonicalJson(existing)) === recordHash) return existing;
+    return this.database.transaction(() => {
+      const revision = this.nextRevision();
+      this.database.prepare(`
+        UPDATE episodes SET revision = ?, title = ?, started_at = ?, ended_at = ?,
+          encrypted_payload = ?, record_hash = ? WHERE episode_id = ?
+      `).run(
+        revision,
+        sanitized.title,
+        sanitized.startedAt,
+        sanitized.endedAt,
+        this.seal("episode", sanitized.episodeId, sanitized),
+        recordHash,
+        sanitized.episodeId,
+      );
+      this.database.prepare("DELETE FROM episodes_fts WHERE episode_id = ?").run(sanitized.episodeId);
+      this.database.prepare(`
+        INSERT INTO episodes_fts(episode_id, user_id, workspace_id, title, summary)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(
+        sanitized.episodeId,
+        sanitized.scope.userId,
+        sanitized.scope.workspaceId ?? null,
+        sanitized.title,
+        this.episodeSearchableSummary(sanitized),
+      );
+      this.database.prepare("DELETE FROM source_links WHERE owner_type = 'episode' AND owner_id = ?")
+        .run(sanitized.episodeId);
+      this.linkSources("episode", sanitized.episodeId, sanitized.eventRefs);
+      this.database.prepare("DELETE FROM embeddings WHERE owner_type = 'episode' AND owner_id = ?")
+        .run(sanitized.episodeId);
+      this.database.prepare("DELETE FROM embedding_buckets WHERE owner_type = 'episode' AND owner_id = ?")
+        .run(sanitized.episodeId);
       this.touchIndex(revision);
       return sanitized;
     })();
@@ -860,11 +1052,44 @@ export class MemoryStore {
     return this.open<EpisodeMemory>("episode", episodeId, String(row.encrypted_payload));
   }
 
-  listEpisodes(scope: ScopeRef): EpisodeMemory[] {
+  listEpisodes(scope: ScopeRef, maxRevision?: number, limit = 500): EpisodeMemory[] {
     const rows = this.database.prepare(`
-      SELECT * FROM episodes WHERE ${this.aclSql(false)} ORDER BY ended_at DESC
-    `).all(this.aclParams(scope)) as Row[];
+      SELECT * FROM episodes WHERE ${this.aclSql(false)} AND revision <= @maxRevision
+      ORDER BY ended_at DESC, revision DESC LIMIT @limit
+    `).all({
+      ...this.aclParams(scope),
+      maxRevision: Math.min(maxRevision ?? this.getRevision(), this.getRevision()),
+      limit: Math.max(1, Math.min(limit, 5_000)),
+    }) as Row[];
     return rows.map((row) => this.open<EpisodeMemory>("episode", String(row.episode_id), String(row.encrypted_payload)));
+  }
+
+  /** Remove only the rebuildable Episode index; authoritative SourceEvents remain untouched. */
+  clearEpisodesForRebuild(scope: ScopeRef): number {
+    this.requireWritable();
+    const rows = this.database.prepare(`
+      SELECT episode_id FROM episodes WHERE ${this.aclSql(false)}
+    `).all(this.aclParams(scope)) as Row[];
+    if (rows.length === 0) return 0;
+    return this.database.transaction(() => {
+      for (const row of rows) {
+        const episodeId = String(row.episode_id);
+        this.database.prepare("DELETE FROM episodes_fts WHERE episode_id = ?").run(episodeId);
+        this.database.prepare("DELETE FROM source_links WHERE owner_type = 'episode' AND owner_id = ?").run(episodeId);
+        this.database.prepare("DELETE FROM embeddings WHERE owner_type = 'episode' AND owner_id = ?").run(episodeId);
+        this.database.prepare("DELETE FROM embedding_buckets WHERE owner_type = 'episode' AND owner_id = ?").run(episodeId);
+        this.database.prepare(`
+          DELETE FROM entity_edges WHERE (from_type = 'episode' AND from_id = ?)
+            OR (to_type = 'episode' AND to_id = ?)
+        `).run(episodeId, episodeId);
+        this.database.prepare("DELETE FROM idempotency_keys WHERE operation = 'put_episode' AND entity_id = ?")
+          .run(episodeId);
+        this.database.prepare("DELETE FROM episodes WHERE episode_id = ?").run(episodeId);
+      }
+      const revision = this.nextRevision();
+      this.touchIndex(revision);
+      return rows.length;
+    })();
   }
 
   putCorrection(
@@ -896,6 +1121,7 @@ export class MemoryStore {
           ...(existing.predicate === undefined ? {} : { predicate: existing.predicate }),
           ...(existing.value === undefined ? {} : { value: existing.value }),
           ...(existing.scopeLevel === undefined ? {} : { scopeLevel: existing.scopeLevel }),
+          ...(existing.origin === undefined ? {} : { origin: existing.origin }),
           explicit: existing.explicit,
           idempotencyKey: existing.idempotencyKey,
         },
@@ -927,6 +1153,7 @@ export class MemoryStore {
       if (sanitizedInput.predicate !== undefined) base.predicate = sanitizedInput.predicate;
       if (sanitizedInput.value !== undefined) base.value = sanitizedInput.value;
       if (sanitizedInput.scopeLevel !== undefined) base.scopeLevel = sanitizedInput.scopeLevel;
+      if (sanitizedInput.origin !== undefined) base.origin = sanitizedInput.origin;
       if (sanitizedSource !== undefined) base.source = sanitizedSource;
 
       this.database.prepare(`
@@ -1033,7 +1260,8 @@ export class MemoryStore {
   }
 
   putTrigger(record: TriggerRecord): TriggerRecord {
-    return this.putAuxiliary(
+    this.assertSourceRefs(record.sourceRefs ?? [], record.scope);
+    const written = this.putAuxiliary(
       "trigger",
       "triggers",
       "trigger_id",
@@ -1054,6 +1282,54 @@ export class MemoryStore {
         record.lastActivatedAt ?? null,
       ],
     );
+    if ((written.sourceRefs ?? []).length > 0) {
+      this.linkSources("trigger", written.triggerId, written.sourceRefs ?? []);
+    }
+    return written;
+  }
+
+  upsertTrigger(record: TriggerRecord): TriggerRecord {
+    this.assertSourceRefs(record.sourceRefs ?? [], record.scope);
+    const existing = this.getTrigger(record.triggerId);
+    const timestamped: TriggerRecord = {
+      ...record,
+      status: record.status ?? "active",
+      createdAt: record.createdAt ?? existing?.createdAt ?? this.isoNow(),
+      updatedAt: this.isoNow(),
+    };
+    const written = this.upsertAuxiliary(
+      "trigger",
+      "triggers",
+      "trigger_id",
+      record.triggerId,
+      timestamped,
+      [
+        "user_id", "workspace_id", "session_id", "policy_id", "risk_code",
+        "priority", "activation_count", "last_activated_at",
+      ],
+      [
+        record.scope.userId,
+        record.scope.workspaceId ?? null,
+        record.scope.sessionId ?? null,
+        record.policyId ?? null,
+        record.riskCode ?? null,
+        record.priority,
+        record.activationCount,
+        record.lastActivatedAt ?? null,
+      ],
+    );
+    this.database.prepare("DELETE FROM source_links WHERE owner_type = 'trigger' AND owner_id = ?").run(written.triggerId);
+    if ((written.sourceRefs ?? []).length > 0) {
+      this.linkSources("trigger", written.triggerId, written.sourceRefs ?? []);
+    }
+    return written;
+  }
+
+  getTrigger(triggerId: string): TriggerRecord | undefined {
+    const row = this.database.prepare("SELECT * FROM triggers WHERE trigger_id = ?").get(triggerId) as Row | undefined;
+    return row === undefined
+      ? undefined
+      : this.open<TriggerRecord>("trigger", triggerId, String(row.encrypted_payload));
   }
 
   listTriggers(scope: ScopeRef, includeAllSessions = false): TriggerRecord[] {
@@ -1063,8 +1339,188 @@ export class MemoryStore {
     return rows.map((row) => this.open<TriggerRecord>("trigger", String(row.trigger_id), String(row.encrypted_payload)));
   }
 
+  putTriggerActivation(input: Omit<TriggerActivationRecord, "activationId" | "revision">): TriggerActivationRecord {
+    this.requireWritable();
+    const turn = this.getTurn(input.turnId, input.scope);
+    if (turn === undefined) this.notFound(`Turn ${input.turnId} was not found`);
+    const activationId = `activation_${sha256(`${input.triggerId}\u001f${input.turnId}`).slice(0, 32)}`;
+    const existing = this.database.prepare("SELECT * FROM trigger_activations WHERE activation_id = ?")
+      .get(activationId) as Row | undefined;
+    if (existing !== undefined) return this.decodeTriggerActivation(existing);
+    return this.database.transaction(() => {
+      const revision = this.nextRevision();
+      const record: TriggerActivationRecord = { ...input, activationId, revision };
+      this.database.prepare(`
+        INSERT INTO trigger_activations(
+          activation_id, revision, trigger_id, turn_id, user_id, workspace_id, session_id,
+          structural_score, similarity_score, effective_score, activated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        activationId,
+        revision,
+        input.triggerId,
+        input.turnId,
+        input.scope.userId,
+        input.scope.workspaceId ?? null,
+        input.scope.sessionId ?? null,
+        Math.max(0, Math.min(1, input.structuralScore)),
+        Math.max(0, Math.min(1, input.similarityScore)),
+        Math.max(0, Math.min(1, input.effectiveScore)),
+        input.activatedAt,
+      );
+      return record;
+    })();
+  }
+
+  listTriggerActivations(triggerId: string): TriggerActivationRecord[] {
+    return (this.database.prepare(`
+      SELECT * FROM trigger_activations WHERE trigger_id = ? ORDER BY activated_at DESC, revision DESC
+    `).all(triggerId) as Row[]).map((row) => this.decodeTriggerActivation(row));
+  }
+
+  enqueueLearningJob(
+    type: LearningJobType,
+    scope: ScopeRef,
+    payload: Record<string, unknown>,
+    idempotencyKey: string,
+  ): LearningJobRecord {
+    this.requireWritable();
+    const jobId = `job_${sha256(idempotencyKey).slice(0, 32)}`;
+    const existing = this.getLearningJob(jobId);
+    const sanitizedPayload = redactSensitiveValue(payload).value;
+    const requestHash = sha256(canonicalJson({ type, scope, payload: sanitizedPayload, idempotencyKey }));
+    if (existing !== undefined) {
+      const existingHash = this.database.prepare("SELECT record_hash FROM learning_jobs WHERE job_id = ?")
+        .get(jobId) as Row;
+      if (String(existingHash.record_hash) !== requestHash) {
+        this.versionConflict(`Learning job idempotency key ${idempotencyKey} was reused`);
+      }
+      return existing;
+    }
+    return this.database.transaction(() => {
+      const revision = this.nextRevision();
+      const availableAt = this.isoNow();
+      const record: LearningJobRecord = {
+        jobId,
+        revision,
+        idempotencyKey,
+        scope,
+        type,
+        status: "pending",
+        attempts: 0,
+        availableAt,
+        payload: sanitizedPayload,
+      };
+      this.database.prepare(`
+        INSERT INTO learning_jobs(
+          job_id, revision, idempotency_key, user_id, workspace_id, session_id,
+          job_type, status, attempts, available_at, leased_at, last_error,
+          encrypted_payload, record_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, NULL, NULL, ?, ?)
+      `).run(
+        jobId,
+        revision,
+        idempotencyKey,
+        scope.userId,
+        scope.workspaceId ?? null,
+        scope.sessionId ?? null,
+        type,
+        availableAt,
+        this.seal("learning_job", jobId, record),
+        requestHash,
+      );
+      return record;
+    })();
+  }
+
+  getLearningJob(jobId: string): LearningJobRecord | undefined {
+    const row = this.database.prepare("SELECT * FROM learning_jobs WHERE job_id = ?").get(jobId) as Row | undefined;
+    return row === undefined ? undefined : this.decodeLearningJob(row);
+  }
+
+  listLearningJobs(status?: LearningJobRecord["status"], scope?: ScopeRef): LearningJobRecord[] {
+    const rows = scope === undefined
+      ? status === undefined
+        ? this.database.prepare("SELECT * FROM learning_jobs ORDER BY revision").all() as Row[]
+        : this.database.prepare("SELECT * FROM learning_jobs WHERE status = ? ORDER BY revision").all(status) as Row[]
+      : this.database.prepare(`
+          SELECT * FROM learning_jobs
+          WHERE ${this.aclSql(false)} AND (@status IS NULL OR status = @status)
+          ORDER BY revision
+        `).all({ ...this.aclParams(scope), status: status ?? null }) as Row[];
+    return rows.map((row) => this.decodeLearningJob(row));
+  }
+
+  claimLearningJobs(limit = 25, now = this.isoNow()): LearningJobRecord[] {
+    this.requireWritable();
+    const staleBefore = new Date(Date.parse(now) - 5 * 60_000).toISOString();
+    return this.database.transaction(() => {
+      this.database.prepare(`
+        UPDATE learning_jobs SET status = 'pending', leased_at = NULL
+        WHERE status = 'running' AND leased_at < ?
+      `).run(staleBefore);
+      const rows = this.database.prepare(`
+        SELECT * FROM learning_jobs
+        WHERE status = 'pending' AND available_at <= ?
+        ORDER BY revision LIMIT ?
+      `).all(now, Math.max(1, Math.min(limit, 100))) as Row[];
+      const claimed: LearningJobRecord[] = [];
+      for (const row of rows) {
+        const job = this.decodeLearningJob(row);
+        const revision = this.nextRevision();
+        const updated: LearningJobRecord = {
+          ...job,
+          revision,
+          status: "running",
+          attempts: job.attempts + 1,
+          leasedAt: now,
+        };
+        this.database.prepare(`
+          UPDATE learning_jobs SET revision = ?, status = 'running', attempts = ?, leased_at = ?,
+            encrypted_payload = ? WHERE job_id = ?
+        `).run(revision, updated.attempts, now, this.seal("learning_job", job.jobId, updated), job.jobId);
+        claimed.push(updated);
+      }
+      return claimed;
+    })();
+  }
+
+  completeLearningJob(jobId: string): LearningJobRecord {
+    return this.updateLearningJobState(jobId, "completed");
+  }
+
+  failLearningJob(jobId: string, error: string, now = this.isoNow()): LearningJobRecord {
+    const job = this.getLearningJob(jobId);
+    if (job === undefined) this.notFound(`Learning job ${jobId} was not found`);
+    const failed = job.attempts >= 5;
+    const nextAt = new Date(Date.parse(now) + Math.min(60_000, 1_000 * (2 ** Math.max(0, job.attempts - 1))))
+      .toISOString();
+    return this.updateLearningJobState(jobId, failed ? "failed" : "pending", {
+      availableAt: nextAt,
+      lastError: redactSensitiveContent(error).value.slice(0, 500),
+    });
+  }
+
   putFailureCluster(record: FailureClusterRecord): FailureClusterRecord {
     return this.putAuxiliary(
+      "failure_cluster",
+      "failure_clusters",
+      "cluster_id",
+      record.clusterId,
+      record,
+      ["user_id", "workspace_id", "status", "correction_count", "session_count"],
+      [
+        record.scope.userId,
+        record.scope.workspaceId ?? null,
+        record.status,
+        record.correctionIds.length,
+        new Set(record.sessionIds).size,
+      ],
+    );
+  }
+
+  upsertFailureCluster(record: FailureClusterRecord): FailureClusterRecord {
+    return this.upsertAuxiliary(
       "failure_cluster",
       "failure_clusters",
       "cluster_id",
@@ -1089,7 +1545,8 @@ export class MemoryStore {
   }
 
   putCalibrationPattern(record: CalibrationPatternRecord): CalibrationPatternRecord {
-    return this.putAuxiliary(
+    this.assertUnscopedSourceRefs(record.sourceRefs ?? []);
+    const written = this.putAuxiliary(
       "calibration_pattern",
       "calibration_patterns",
       "pattern_id",
@@ -1098,6 +1555,33 @@ export class MemoryStore {
       ["agent_profile_key", "status"],
       [record.agentProfileKey, record.status],
     );
+    if ((written.sourceRefs ?? []).length > 0) this.linkSources("calibration_pattern", written.patternId, written.sourceRefs ?? []);
+    return written;
+  }
+
+  upsertCalibrationPattern(record: CalibrationPatternRecord): CalibrationPatternRecord {
+    this.assertUnscopedSourceRefs(record.sourceRefs ?? []);
+    const written = this.upsertAuxiliary(
+      "calibration_pattern",
+      "calibration_patterns",
+      "pattern_id",
+      record.patternId,
+      record,
+      ["agent_profile_key", "status"],
+      [record.agentProfileKey, record.status],
+    );
+    this.database.prepare("DELETE FROM source_links WHERE owner_type = 'calibration_pattern' AND owner_id = ?")
+      .run(written.patternId);
+    if ((written.sourceRefs ?? []).length > 0) this.linkSources("calibration_pattern", written.patternId, written.sourceRefs ?? []);
+    return written;
+  }
+
+  getCalibrationPattern(patternId: string): CalibrationPatternRecord | undefined {
+    const row = this.database.prepare("SELECT * FROM calibration_patterns WHERE pattern_id = ?")
+      .get(patternId) as Row | undefined;
+    return row === undefined
+      ? undefined
+      : this.open<CalibrationPatternRecord>("calibration_pattern", patternId, String(row.encrypted_payload));
   }
 
   listCalibrationPatterns(agentProfileKey: string, includeInactive = false): CalibrationPatternRecord[] {
@@ -1111,6 +1595,286 @@ export class MemoryStore {
       String(row.pattern_id),
       String(row.encrypted_payload),
     ));
+  }
+
+  listCalibrationPatternsForScope(scope: ScopeRef, includeInactive = false): CalibrationPatternRecord[] {
+    const visible = this.aclSql(false, "e");
+    const rows = this.database.prepare(`
+      SELECT c.* FROM calibration_patterns c
+      WHERE (@includeInactive = 1 OR c.status = 'active')
+        AND EXISTS (
+          SELECT 1 FROM source_links l
+          JOIN source_events e ON e.event_id = l.event_id
+          WHERE l.owner_type = 'calibration_pattern' AND l.owner_id = c.pattern_id
+            AND ${visible}
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM source_links l
+          JOIN source_events e ON e.event_id = l.event_id
+          WHERE l.owner_type = 'calibration_pattern' AND l.owner_id = c.pattern_id
+            AND NOT (${visible})
+        )
+      ORDER BY c.revision DESC
+    `).all({ ...this.aclParams(scope), includeInactive: includeInactive ? 1 : 0 }) as Row[];
+    return rows.map((row) => this.open<CalibrationPatternRecord>(
+      "calibration_pattern",
+      String(row.pattern_id),
+      String(row.encrypted_payload),
+    ));
+  }
+
+  getOwnerMetadata(
+    kind: SearchKind,
+    id: string,
+    scope: ScopeRef,
+    maxRevision = this.getRevision(),
+  ): OwnerMetadata | undefined {
+    const row = kind === "source_event"
+      ? this.database.prepare("SELECT * FROM source_events WHERE event_id = ?").get(id) as Row | undefined
+      : kind === "world_claim"
+        ? (() => {
+            const [claimId, version] = this.parseVersionedId(id);
+            return this.database.prepare("SELECT * FROM world_claims WHERE claim_id = ? AND version = ?")
+              .get(claimId, version) as Row | undefined;
+          })()
+        : kind === "policy"
+          ? (() => {
+              const [policyId, version] = this.parseVersionedId(id);
+              return this.database.prepare("SELECT * FROM policies WHERE policy_id = ? AND version = ?")
+                .get(policyId, version) as Row | undefined;
+            })()
+          : this.database.prepare("SELECT * FROM episodes WHERE episode_id = ?").get(id) as Row | undefined;
+    if (row === undefined || Number(row.revision) > Math.min(maxRevision, this.getRevision())) return undefined;
+    try {
+      this.assertAcl(row, scope, kind === "world_claim" || kind === "policy");
+    } catch (error) {
+      if (error instanceof ProtocolError && error.shape.code === "SCOPE_DENIED") return undefined;
+      throw error;
+    }
+    const occurredAt = kind === "source_event"
+      ? String(row.occurred_at)
+      : kind === "episode"
+        ? String(row.ended_at)
+        : undefined;
+    return {
+      kind,
+      id,
+      revision: Number(row.revision),
+      ...(occurredAt === undefined ? {} : { occurredAt }),
+      ...(typeof row.session_id === "string" ? { sessionId: row.session_id } : {}),
+    };
+  }
+
+  putEmbedding(
+    ownerType: SearchKind,
+    ownerId: string,
+    scope: ScopeRef,
+    provider: string,
+    model: string,
+    vector: readonly number[],
+  ): StoredEmbedding {
+    this.requireWritable();
+    const metadata = this.getOwnerMetadata(ownerType, ownerId, scope);
+    if (metadata === undefined) this.notFound(`${ownerType} ${ownerId} was not found in scope`);
+    if (vector.length < 8 || vector.length > 4_096 || vector.some((value) => !Number.isFinite(value))) {
+      throw new ProtocolError({ code: "INVALID_REQUEST", message: "Embedding vector is invalid" });
+    }
+    const normalized = Float32Array.from(vector);
+    const bytes = Buffer.from(normalized.buffer, normalized.byteOffset, normalized.byteLength);
+    this.database.transaction(() => {
+      this.database.prepare(`
+        INSERT INTO embeddings(owner_type, owner_id, provider, model, vector)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(owner_type, owner_id, provider, model)
+        DO UPDATE SET vector = excluded.vector
+      `).run(ownerType, ownerId, provider, model, bytes);
+      this.database.prepare(`
+        DELETE FROM embedding_buckets
+        WHERE owner_type = ? AND owner_id = ? AND provider = ? AND model = ?
+      `).run(ownerType, ownerId, provider, model);
+      const insertBucket = this.database.prepare(`
+        INSERT OR IGNORE INTO embedding_buckets(provider, model, bucket, owner_type, owner_id)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+      for (const bucket of this.embeddingBuckets(vector)) {
+        insertBucket.run(provider, model, bucket, ownerType, ownerId);
+      }
+    })();
+    return { ...metadata, ownerType, ownerId, provider, model, vector: [...normalized] };
+  }
+
+  getEmbedding(
+    ownerType: SearchKind,
+    ownerId: string,
+    scope: ScopeRef,
+    provider: string,
+    model: string,
+    maxRevision = this.getRevision(),
+  ): StoredEmbedding | undefined {
+    const metadata = this.getOwnerMetadata(ownerType, ownerId, scope, maxRevision);
+    if (metadata === undefined) return undefined;
+    const row = this.database.prepare(`
+      SELECT vector FROM embeddings WHERE owner_type = ? AND owner_id = ? AND provider = ? AND model = ?
+    `).get(ownerType, ownerId, provider, model) as Row | undefined;
+    if (row === undefined || !Buffer.isBuffer(row.vector)) return undefined;
+    const bytes = row.vector;
+    const copied = Uint8Array.from(bytes);
+    return {
+      ...metadata,
+      ownerType,
+      ownerId,
+      provider,
+      model,
+      vector: [...new Float32Array(copied.buffer)],
+    };
+  }
+
+  listEmbeddings(
+    scope: ScopeRef,
+    provider: string,
+    model: string,
+    options: { kinds?: SearchKind[]; maxRevision?: number; limit?: number; queryVector?: readonly number[] } = {},
+  ): StoredEmbedding[] {
+    const kinds = new Set(options.kinds ?? ["source_event", "world_claim", "policy", "episode"]);
+    const requestedLimit = Math.max(1, Math.min(options.limit ?? 1_000, 10_000));
+    const buckets = options.queryVector === undefined ? [] : this.embeddingBuckets(options.queryVector);
+    const rows = buckets.length === 0
+      ? this.database.prepare(`
+          SELECT * FROM embeddings WHERE provider = ? AND model = ?
+          ORDER BY owner_type, owner_id LIMIT ?
+        `).all(provider, model, Math.min(5_000, requestedLimit * 5)) as Row[]
+      : this.database.prepare(`
+          SELECT e.*, count(*) AS bucket_overlap
+          FROM embedding_buckets b
+          JOIN embeddings e ON e.provider = b.provider AND e.model = b.model
+            AND e.owner_type = b.owner_type AND e.owner_id = b.owner_id
+          WHERE b.provider = @provider AND b.model = @model
+            AND b.bucket IN (${buckets.map((_, index) => `@bucket${index}`).join(", ")})
+          GROUP BY e.owner_type, e.owner_id, e.provider, e.model
+          ORDER BY bucket_overlap DESC, e.owner_type, e.owner_id
+          LIMIT @candidateLimit
+        `).all({
+          provider,
+          model,
+          candidateLimit: Math.min(5_000, requestedLimit * 5),
+          ...Object.fromEntries(buckets.map((bucket, index) => [`bucket${index}`, bucket])),
+        }) as Row[];
+    const result: StoredEmbedding[] = [];
+    for (const row of rows) {
+      const ownerType = String(row.owner_type) as SearchKind;
+      if (!kinds.has(ownerType) || !Buffer.isBuffer(row.vector)) continue;
+      const ownerId = String(row.owner_id);
+      const metadata = this.getOwnerMetadata(ownerType, ownerId, scope, options.maxRevision);
+      if (metadata === undefined) continue;
+      const copied = Uint8Array.from(row.vector);
+      result.push({
+        ...metadata,
+        ownerType,
+        ownerId,
+        provider,
+        model,
+        vector: [...new Float32Array(copied.buffer)],
+      });
+      if (result.length >= requestedLimit) break;
+    }
+    return result;
+  }
+
+  replaceEntityIndex(ownerType: SearchKind, ownerId: string, scope: ScopeRef, tokens: readonly string[]): void {
+    this.requireWritable();
+    if (this.getOwnerMetadata(ownerType, ownerId, scope) === undefined) {
+      this.notFound(`${ownerType} ${ownerId} was not found in scope`);
+    }
+    this.database.prepare(`DELETE FROM entity_edges WHERE to_type = ? AND to_id = ? AND relation = 'mentions'`)
+      .run(ownerType, ownerId);
+    const insert = this.database.prepare(`
+      INSERT OR IGNORE INTO entity_edges(
+        edge_id, user_id, workspace_id, from_type, from_id, to_type, to_id, relation
+      ) VALUES (?, ?, ?, 'entity', ?, ?, ?, 'mentions')
+    `);
+    for (const token of this.normalizedEntityTokens(tokens)) {
+      const entityId = this.entityTokenId(scope, token);
+      const edgeId = sha256(canonicalJson([scope.userId, scope.workspaceId ?? null, entityId, ownerType, ownerId]));
+      insert.run(edgeId, scope.userId, scope.workspaceId ?? null, entityId, ownerType, ownerId);
+    }
+  }
+
+  linkEntityRelation(scope: ScopeRef, fromToken: string, toToken: string, relation: string): void {
+    this.requireWritable();
+    const [from, to] = this.normalizedEntityTokens([fromToken, toToken]);
+    if (from === undefined || to === undefined || from === to) return;
+    const fromId = this.entityTokenId(scope, from);
+    const toId = this.entityTokenId(scope, to);
+    const safeRelation = `relation:${sha256(relation.trim().toLowerCase()).slice(0, 16)}`;
+    const edgeId = sha256(canonicalJson([scope.userId, scope.workspaceId ?? null, fromId, toId, safeRelation]));
+    this.database.prepare(`
+      INSERT OR IGNORE INTO entity_edges(
+        edge_id, user_id, workspace_id, from_type, from_id, to_type, to_id, relation
+      ) VALUES (?, ?, ?, 'entity', ?, 'entity', ?, ?)
+    `).run(edgeId, scope.userId, scope.workspaceId ?? null, fromId, toId, safeRelation);
+  }
+
+  findEntityOwners(
+    tokens: readonly string[],
+    scope: ScopeRef,
+    options: { kinds?: SearchKind[]; maxRevision?: number; maxDistance?: number; limit?: number } = {},
+  ): EntityOwnerHit[] {
+    const kinds = new Set(options.kinds ?? ["source_event", "world_claim", "policy", "episode"]);
+    const maxDistance = Math.max(0, Math.min(options.maxDistance ?? 1, 2));
+    const normalized = this.normalizedEntityTokens(tokens);
+    const seedIds = new Set<string>();
+    for (const token of normalized) {
+      seedIds.add(this.entityTokenId({ userId: scope.userId }, token));
+      if (scope.workspaceId !== undefined) seedIds.add(this.entityTokenId(scope, token));
+    }
+    const distance = new Map([...seedIds].map((id) => [id, 0]));
+    let frontier = [...seedIds];
+    for (let hop = 0; hop < maxDistance && frontier.length > 0; hop += 1) {
+      const placeholders = frontier.map((_, index) => `@entity${index}`).join(", ");
+      const rows = this.database.prepare(`
+        SELECT from_id, to_id FROM entity_edges
+        WHERE user_id = @userId
+          AND (workspace_id IS NULL OR workspace_id = @workspaceId)
+          AND from_type = 'entity' AND to_type = 'entity'
+          AND (from_id IN (${placeholders}) OR to_id IN (${placeholders}))
+      `).all({
+        ...this.aclParams(scope),
+        ...Object.fromEntries(frontier.map((id, index) => [`entity${index}`, id])),
+      }) as Row[];
+      const next: string[] = [];
+      for (const row of rows) {
+        for (const id of [String(row.from_id), String(row.to_id)]) {
+          if (distance.has(id)) continue;
+          distance.set(id, hop + 1);
+          next.push(id);
+        }
+      }
+      frontier = next;
+    }
+    if (distance.size === 0) return [];
+    const ids = [...distance.keys()];
+    const placeholders = ids.map((_, index) => `@entity${index}`).join(", ");
+    const rows = this.database.prepare(`
+      SELECT from_id, to_type, to_id FROM entity_edges
+      WHERE user_id = @userId AND (workspace_id IS NULL OR workspace_id = @workspaceId)
+        AND from_type = 'entity' AND relation = 'mentions' AND from_id IN (${placeholders})
+    `).all({
+      ...this.aclParams(scope),
+      ...Object.fromEntries(ids.map((id, index) => [`entity${index}`, id])),
+    }) as Row[];
+    const best = new Map<string, EntityOwnerHit>();
+    for (const row of rows) {
+      const kind = String(row.to_type) as SearchKind;
+      const id = String(row.to_id);
+      if (!kinds.has(kind) || this.getOwnerMetadata(kind, id, scope, options.maxRevision) === undefined) continue;
+      const hit: EntityOwnerHit = { kind, id, distance: distance.get(String(row.from_id)) ?? maxDistance };
+      const key = `${kind}\u001f${id}`;
+      const prior = best.get(key);
+      if (prior === undefined || hit.distance < prior.distance) best.set(key, hit);
+    }
+    return [...best.values()]
+      .sort((left, right) => left.distance - right.distance || left.kind.localeCompare(right.kind) || left.id.localeCompare(right.id))
+      .slice(0, Math.max(1, Math.min(options.limit ?? 200, 2_000)));
   }
 
   search(query: string, scope: ScopeRef, options: SearchOptions = {}): StorageSearchResult {
@@ -1139,14 +1903,11 @@ export class MemoryStore {
 
     if (requestedKinds.has("source_event")) {
       const rows = this.database.prepare(`
-        WITH allowed AS MATERIALIZED (
-          SELECT e.event_id FROM source_events e
-          WHERE ${this.aclSql(false, "e")} AND e.revision <= @snapshotRevision
-        )
         SELECT source_events_fts.event_id AS id, bm25(source_events_fts) AS rank
-        FROM allowed
-        JOIN source_events_fts ON source_events_fts.event_id = allowed.event_id
+        FROM source_events_fts
+        JOIN source_events e ON e.event_id = source_events_fts.event_id
         WHERE source_events_fts MATCH @query
+          AND ${this.aclSql(false, "e")} AND e.revision <= @snapshotRevision
         ORDER BY rank LIMIT @limit
       `).all({ ...acl, query: ftsQuery, limit }) as Row[];
       rawHits.push(...rows.map((row) => ({
@@ -1159,15 +1920,12 @@ export class MemoryStore {
     if (requestedKinds.has("world_claim")) {
       const statusClause = options.includeInactive ? "" : "AND w.status IN ('active', 'disputed')";
       const rows = this.database.prepare(`
-        WITH allowed AS MATERIALIZED (
-          SELECT (w.claim_id || '${OWNER_ID_SEPARATOR}' || w.version) AS row_key
-          FROM world_claims w
-          WHERE ${this.aclSql(true, "w")} AND w.revision <= @snapshotRevision ${statusClause}
-        )
         SELECT world_claims_fts.row_key AS id, bm25(world_claims_fts) AS rank
-        FROM allowed
-        JOIN world_claims_fts ON world_claims_fts.row_key = allowed.row_key
+        FROM world_claims_fts
+        JOIN world_claims w
+          ON world_claims_fts.row_key = (w.claim_id || '${OWNER_ID_SEPARATOR}' || w.version)
         WHERE world_claims_fts MATCH @query
+          AND ${this.aclSql(true, "w")} AND w.revision <= @snapshotRevision ${statusClause}
         ORDER BY rank LIMIT @limit
       `).all({ ...acl, query: ftsQuery, limit }) as Row[];
       rawHits.push(...rows.map((row) => ({
@@ -1180,19 +1938,16 @@ export class MemoryStore {
     if (requestedKinds.has("policy")) {
       const statusClause = options.includeInactive ? "" : "AND p.review_status = 'approved'";
       const rows = this.database.prepare(`
-        WITH allowed AS MATERIALIZED (
-          SELECT (p.policy_id || '${OWNER_ID_SEPARATOR}' || p.version) AS row_key
-          FROM policies p
-          WHERE ${this.aclSql(true, "p")} AND p.revision <= @snapshotRevision ${statusClause} AND NOT EXISTS (
+        SELECT policies_fts.row_key AS id, bm25(policies_fts) AS rank
+        FROM policies_fts
+        JOIN policies p
+          ON policies_fts.row_key = (p.policy_id || '${OWNER_ID_SEPARATOR}' || p.version)
+        WHERE policies_fts MATCH @query
+          AND ${this.aclSql(true, "p")} AND p.revision <= @snapshotRevision ${statusClause} AND NOT EXISTS (
             SELECT 1 FROM policies newer
             WHERE newer.policy_id = p.policy_id AND newer.version > p.version
               AND newer.revision <= @snapshotRevision
           )
-        )
-        SELECT policies_fts.row_key AS id, bm25(policies_fts) AS rank
-        FROM allowed
-        JOIN policies_fts ON policies_fts.row_key = allowed.row_key
-        WHERE policies_fts MATCH @query
         ORDER BY rank LIMIT @limit
       `).all({ ...acl, query: ftsQuery, limit }) as Row[];
       rawHits.push(...rows.map((row) => ({
@@ -1204,14 +1959,11 @@ export class MemoryStore {
 
     if (requestedKinds.has("episode")) {
       const rows = this.database.prepare(`
-        WITH allowed AS MATERIALIZED (
-          SELECT e.episode_id FROM episodes e
-          WHERE ${this.aclSql(false, "e")} AND e.revision <= @snapshotRevision
-        )
         SELECT episodes_fts.episode_id AS id, bm25(episodes_fts) AS rank
-        FROM allowed
-        JOIN episodes_fts ON episodes_fts.episode_id = allowed.episode_id
+        FROM episodes_fts
+        JOIN episodes e ON e.episode_id = episodes_fts.episode_id
         WHERE episodes_fts MATCH @query
+          AND ${this.aclSql(false, "e")} AND e.revision <= @snapshotRevision
         ORDER BY rank LIMIT @limit
       `).all({ ...acl, query: ftsQuery, limit }) as Row[];
       rawHits.push(...rows.map((row) => ({
@@ -1328,6 +2080,10 @@ export class MemoryStore {
       this.open<FailureClusterRecord>("failure_cluster", String(row.cluster_id), String(row.encrypted_payload)));
     const calibrationPatterns = rows("SELECT * FROM calibration_patterns ORDER BY revision, pattern_id").map((row) =>
       this.open<CalibrationPatternRecord>("calibration_pattern", String(row.pattern_id), String(row.encrypted_payload)));
+    const sessions = rows("SELECT * FROM session_lifecycle ORDER BY revision, session_id").map((row) =>
+      this.required(this.getSession(String(row.session_id)), `session ${String(row.session_id)}`));
+    const triggerActivations = rows("SELECT * FROM trigger_activations ORDER BY revision, activation_id")
+      .map((row) => this.decodeTriggerActivation(row));
     const tombstones = rows("SELECT * FROM tombstones ORDER BY revision, entity_type, entity_id");
     const payload: ExportPackage = {
       format: "memoryd-export",
@@ -1348,6 +2104,8 @@ export class MemoryStore {
         triggers,
         failureClusters,
         calibrationPatterns,
+        sessions,
+        triggerActivations,
         tombstones,
       },
     };
@@ -1495,6 +2253,32 @@ export class MemoryStore {
         || this.hasTombstone("calibration_pattern", pattern.patternId);
       run("calibration_pattern", pattern.patternId, existed, () => this.putCalibrationPattern(pattern));
     }
+    for (const session of payload.records.sessions ?? []) {
+      const existed = this.getSession(session.scope.sessionId) !== undefined;
+      run("session", session.scope.sessionId, existed, () => {
+        this.ensureSession(session.scope, session.startedAt);
+        if (session.status === "ended") {
+          this.endSession(
+            session.scope,
+            session.endIdempotencyKey ?? `import:end:${session.scope.sessionId}`,
+            session.endedAt ?? session.startedAt,
+          );
+        }
+      });
+    }
+    for (const activation of payload.records.triggerActivations ?? []) {
+      const existed = this.database.prepare("SELECT 1 FROM trigger_activations WHERE activation_id = ?")
+        .get(activation.activationId) !== undefined;
+      run("trigger_activation", activation.activationId, existed, () => this.putTriggerActivation({
+        triggerId: activation.triggerId,
+        turnId: activation.turnId,
+        scope: activation.scope,
+        structuralScore: activation.structuralScore,
+        similarityScore: activation.similarityScore,
+        effectiveScore: activation.effectiveScore,
+        activatedAt: activation.activatedAt,
+      }));
+    }
 
     return { imported, skipped, conflicts, revision: this.getRevision() };
   }
@@ -1512,12 +2296,17 @@ export class MemoryStore {
         DELETE FROM policies_fts;
         DELETE FROM episodes_fts;
         DELETE FROM source_links;
+        DELETE FROM embeddings;
+        DELETE FROM embedding_buckets;
+        DELETE FROM entity_edges;
       `);
       const indexed: Record<string, number> = {
         source_event: 0,
         world_claim: 0,
         policy: 0,
         episode: 0,
+        embedding: 0,
+        entity_edge: 0,
       };
       for (const row of this.database.prepare("SELECT * FROM source_events").all() as Row[]) {
         const event = this.decodeSourceEvent(row);
@@ -1561,7 +2350,7 @@ export class MemoryStore {
           episode.scope.userId,
           episode.scope.workspaceId ?? null,
           episode.title,
-          episode.summary ?? "",
+          this.episodeSearchableSummary(episode),
         );
         this.linkSources("episode", episode.episodeId, episode.eventRefs);
         indexed.episode = (indexed.episode ?? 0) + 1;
@@ -1627,6 +2416,7 @@ export class MemoryStore {
       issues.push(`Unexpected journal mode: ${journalMode}`);
     }
     const eventCount = Number((this.database.prepare("SELECT count(*) AS count FROM source_events").get() as Row).count);
+    const count = (sql: string): number => Number((this.database.prepare(sql).get() as Row).count);
     return {
       ok: issues.length === 0,
       schemaVersion: Number(this.database.pragma("user_version", { simple: true })),
@@ -1636,6 +2426,11 @@ export class MemoryStore {
       ftsAvailable,
       integrityCheck,
       eventCount,
+      pendingLearningJobs: count("SELECT count(*) AS count FROM learning_jobs WHERE status IN ('pending', 'running')"),
+      failedLearningJobs: count("SELECT count(*) AS count FROM learning_jobs WHERE status = 'failed'"),
+      endedSessions: count("SELECT count(*) AS count FROM session_lifecycle WHERE status = 'ended'"),
+      embeddingCount: count("SELECT count(*) AS count FROM embeddings"),
+      entityEdgeCount: count("SELECT count(*) AS count FROM entity_edges"),
       issues,
     };
   }
@@ -1700,7 +2495,21 @@ export class MemoryStore {
 
   private decodeTurn(row: Row): StoredTurn {
     const turnId = String(row.turn_id);
-    const plan = this.open<TurnPlan>("turn", turnId, String(row.encrypted_plan));
+    const persistedPlan = this.open<Omit<TurnPlan, "protocolVersion"> & { protocolVersion: string }>(
+      "turn",
+      turnId,
+      String(row.encrypted_plan),
+    );
+    const plan: TurnPlan = persistedPlan.protocolVersion === PROTOCOL_VERSION
+      ? persistedPlan as TurnPlan
+      : persistedPlan.protocolVersion === "1.0"
+        ? { ...persistedPlan, protocolVersion: PROTOCOL_VERSION }
+        : (() => {
+            throw new ProtocolError({
+              code: "VERSION_CONFLICT",
+              message: `Turn ${turnId} uses unsupported stored protocol ${persistedPlan.protocolVersion}; start a new turn`,
+            });
+          })();
     return {
       turnId,
       revision: Number(row.revision),
@@ -1713,6 +2522,38 @@ export class MemoryStore {
       status: String(row.status) as StoredTurn["status"],
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
+    };
+  }
+
+  private decodeTriggerActivation(row: Row): TriggerActivationRecord {
+    return {
+      activationId: String(row.activation_id),
+      revision: Number(row.revision),
+      triggerId: String(row.trigger_id),
+      turnId: String(row.turn_id),
+      scope: this.scopeFromRow(row),
+      structuralScore: Number(row.structural_score),
+      similarityScore: Number(row.similarity_score),
+      effectiveScore: Number(row.effective_score),
+      activatedAt: String(row.activated_at),
+    };
+  }
+
+  private decodeLearningJob(row: Row): LearningJobRecord {
+    const jobId = String(row.job_id);
+    const stored = this.open<LearningJobRecord>("learning_job", jobId, String(row.encrypted_payload));
+    return {
+      ...stored,
+      jobId,
+      revision: Number(row.revision),
+      idempotencyKey: String(row.idempotency_key),
+      scope: this.scopeFromRow(row),
+      type: String(row.job_type) as LearningJobType,
+      status: String(row.status) as LearningJobRecord["status"],
+      attempts: Number(row.attempts),
+      availableAt: String(row.available_at),
+      ...(typeof row.leased_at === "string" ? { leasedAt: row.leased_at } : {}),
+      ...(typeof row.last_error === "string" ? { lastError: row.last_error } : {}),
     };
   }
 
@@ -1809,6 +2650,18 @@ export class MemoryStore {
     }
   }
 
+  /**
+   * Calibration overlays are keyed by agent profile instead of a memory scope, but
+   * their provenance must still resolve to an exact authoritative SourceEvent.
+   */
+  private assertUnscopedSourceRefs(refs: readonly SourceRef[]): void {
+    for (const ref of refs) {
+      const event = this.getSourceEvent(ref.eventId);
+      if (!event) this.notFound(`Source event ${ref.eventId} was not found`);
+      this.assertSourceRef(ref, event);
+    }
+  }
+
   private assertSourceRef(ref: SourceRef, event: SourceEvent): void {
     const expected = this.toSourceRef(event);
     if (
@@ -1864,6 +2717,36 @@ export class MemoryStore {
     return `${prefix}user_id = @userId AND ${workspace}${session}`;
   }
 
+  private normalizedEntityTokens(tokens: readonly string[]): string[] {
+    return [...new Set(tokens
+      .map((token) => token.normalize("NFKC").trim().toLocaleLowerCase())
+      .filter((token) => token.length >= 2 && token.length <= 160))]
+      .sort((left, right) => left.localeCompare(right));
+  }
+
+  private embeddingBuckets(vector: readonly number[]): string[] {
+    const strongest = vector
+      .map((value, index) => ({ index, value, magnitude: Math.abs(value) }))
+      .filter((item) => Number.isFinite(item.value) && item.magnitude > 0)
+      .sort((left, right) => right.magnitude - left.magnitude || left.index - right.index)
+      .slice(0, 6);
+    const singles = strongest.map((item) => `v1:d${item.index}:${item.value >= 0 ? "+" : "-"}`);
+    const pairs = strongest.slice(0, 3).flatMap((item, index, values) => {
+      const next = values[index + 1];
+      return next === undefined
+        ? []
+        : [`v1:p${Math.min(item.index, next.index)}:${Math.max(item.index, next.index)}:${item.value >= 0 ? "+" : "-"}${next.value >= 0 ? "+" : "-"}`];
+    });
+    return [...new Set([...singles, ...pairs])];
+  }
+
+  private entityTokenId(scope: Pick<ScopeRef, "userId" | "workspaceId">, token: string): string {
+    // Entity names never enter the plaintext graph; matching uses a keyed local digest.
+    return createHmac("sha256", this.key)
+      .update(canonicalJson([scope.userId, scope.workspaceId ?? null, token]))
+      .digest("hex");
+  }
+
   private aclParams(scope: ScopeRef): { userId: string; workspaceId: string | null; sessionId: string | null } {
     return {
       userId: scope.userId,
@@ -1896,6 +2779,17 @@ export class MemoryStore {
 
   private searchableValue(value: unknown): string {
     return typeof value === "string" ? value : canonicalJson(value);
+  }
+
+  private episodeSearchableSummary(episode: EpisodeMemory): string {
+    const extended = episode as EpisodeMemory & { topicTerms?: unknown; entityKeys?: unknown };
+    const topicTerms = Array.isArray(extended.topicTerms)
+      ? extended.topicTerms.filter((value): value is string => typeof value === "string")
+      : [];
+    const entityKeys = Array.isArray(extended.entityKeys)
+      ? extended.entityKeys.filter((value): value is string => typeof value === "string")
+      : [];
+    return [episode.summary ?? "", ...episode.tags, ...topicTerms, ...entityKeys].join(" ");
   }
 
   private versionedId(id: string, version: number): string {
@@ -1999,6 +2893,72 @@ export class MemoryStore {
     })();
   }
 
+  /** Mutable helper reserved for derived learning/index records, never authoritative events. */
+  private upsertAuxiliary<T extends object>(
+    entityType: string,
+    table: string,
+    idColumn: string,
+    id: string,
+    value: T,
+    columns: readonly string[],
+    columnValues: readonly unknown[],
+  ): T {
+    this.requireWritable();
+    this.assertSqlIdentifier(table);
+    this.assertSqlIdentifier(idColumn);
+    for (const column of columns) this.assertSqlIdentifier(column);
+    const sanitized = redactSensitiveValue(value).value;
+    const recordHash = sha256(canonicalJson(sanitized));
+    const existing = this.database.prepare(`SELECT * FROM ${table} WHERE ${idColumn} = ?`).get(id) as Row | undefined;
+    if (existing !== undefined && String(existing.record_hash) === recordHash) {
+      return this.open<T>(entityType, id, String(existing.encrypted_payload));
+    }
+    if (existing === undefined) this.assertNotTombstoned(entityType, id);
+    return this.database.transaction(() => {
+      const revision = this.nextRevision();
+      if (existing === undefined) {
+        const names = [idColumn, "revision", ...columns, "encrypted_payload", "record_hash"];
+        const placeholders = names.map(() => "?").join(", ");
+        this.database.prepare(`INSERT INTO ${table}(${names.join(", ")}) VALUES (${placeholders})`)
+          .run(id, revision, ...columnValues, this.seal(entityType, id, sanitized), recordHash);
+      } else {
+        const assignments = ["revision = ?", ...columns.map((column) => `${column} = ?`), "encrypted_payload = ?", "record_hash = ?"];
+        this.database.prepare(`UPDATE ${table} SET ${assignments.join(", ")} WHERE ${idColumn} = ?`)
+          .run(revision, ...columnValues, this.seal(entityType, id, sanitized), recordHash, id);
+      }
+      return sanitized;
+    })();
+  }
+
+  private updateLearningJobState(
+    jobId: string,
+    status: LearningJobRecord["status"],
+    patch: Pick<LearningJobRecord, "availableAt" | "lastError"> | Partial<Pick<LearningJobRecord, "availableAt" | "lastError">> = {},
+  ): LearningJobRecord {
+    this.requireWritable();
+    const job = this.getLearningJob(jobId);
+    if (job === undefined) this.notFound(`Learning job ${jobId} was not found`);
+    return this.database.transaction(() => {
+      const revision = this.nextRevision();
+      const { leasedAt: _leasedAt, ...withoutLease } = job;
+      const updated: LearningJobRecord = status === "running"
+        ? { ...job, ...patch, revision, status }
+        : { ...withoutLease, ...patch, revision, status };
+      this.database.prepare(`
+        UPDATE learning_jobs SET revision = ?, status = ?, available_at = ?, leased_at = NULL,
+          last_error = ?, encrypted_payload = ? WHERE job_id = ?
+      `).run(
+        revision,
+        status,
+        updated.availableAt,
+        updated.lastError ?? null,
+        this.seal("learning_job", jobId, updated),
+        jobId,
+      );
+      return updated;
+    })();
+  }
+
   private collectScopedEntities(selector: ForgetSelector): Array<{ type: string; id: string }> {
     const where: string[] = ["user_id = @userId"];
     const params: Record<string, unknown> = { userId: selector.userId };
@@ -2032,6 +2992,7 @@ export class MemoryStore {
         : []),
       ...collect("source_events", "event_id", "source_event"),
       ...collect("turns", "turn_id", "turn"),
+      ...collect("session_lifecycle", "session_id", "session"),
     ];
   }
 
@@ -2153,6 +3114,129 @@ export class MemoryStore {
       }
     }
 
+    if (row && entityType === "session") {
+      const sessionSelector: ForgetSelector = {
+        userId: String(row.user_id),
+        sessionId: entityId,
+      };
+      if (typeof row.workspace_id === "string") sessionSelector.workspaceId = row.workspace_id;
+      if (selector.reason !== undefined) sessionSelector.reason = selector.reason;
+      for (const child of this.collectScopedEntities(sessionSelector)) {
+        if (child.type === "session" && child.id === entityId) continue;
+        tombstonesCreated += this.deleteEntity(
+          child.type,
+          child.id,
+          sessionSelector,
+          revision,
+          deletedAt,
+          deleted,
+          seen,
+        );
+      }
+    }
+
+    if (row && entityType === "correction") {
+      const clusterRows = this.database.prepare(`
+        SELECT * FROM failure_clusters
+        WHERE user_id = ? AND (workspace_id IS NULL OR workspace_id = ?)
+      `).all(String(row.user_id), row.workspace_id ?? null) as Row[];
+      for (const clusterRow of clusterRows) {
+        const clusterId = String(clusterRow.cluster_id);
+        const cluster = this.open<FailureClusterRecord>(
+          "failure_cluster",
+          clusterId,
+          String(clusterRow.encrypted_payload),
+        );
+        if (!this.failureClusterReferencesCorrection(cluster, entityId)) continue;
+        const clusterSelector: ForgetSelector = { userId: cluster.scope.userId };
+        if (cluster.scope.workspaceId !== undefined) clusterSelector.workspaceId = cluster.scope.workspaceId;
+        if (selector.reason !== undefined) clusterSelector.reason = selector.reason;
+        tombstonesCreated += this.deleteEntity(
+          "failure_cluster",
+          clusterId,
+          clusterSelector,
+          revision,
+          deletedAt,
+          deleted,
+          seen,
+        );
+      }
+    }
+
+    if (row && entityType === "failure_cluster") {
+      const cluster = this.open<FailureClusterRecord>(
+        "failure_cluster",
+        entityId,
+        String(row.encrypted_payload),
+      );
+      const artifactIds = [entityId, ...cluster.correctionIds];
+      const triggerRows = this.database.prepare(`
+        SELECT * FROM triggers
+        WHERE user_id = ? AND (workspace_id IS NULL OR workspace_id = ?)
+      `).all(cluster.scope.userId, cluster.scope.workspaceId ?? null) as Row[];
+      for (const triggerRow of triggerRows) {
+        const triggerId = String(triggerRow.trigger_id);
+        const trigger = this.open<TriggerRecord>("trigger", triggerId, String(triggerRow.encrypted_payload));
+        if (trigger.learnedFromClusterId !== entityId) continue;
+        const triggerSelector: ForgetSelector = { userId: trigger.scope.userId };
+        if (trigger.scope.workspaceId !== undefined) triggerSelector.workspaceId = trigger.scope.workspaceId;
+        if (trigger.scope.sessionId !== undefined) triggerSelector.sessionId = trigger.scope.sessionId;
+        if (selector.reason !== undefined) triggerSelector.reason = selector.reason;
+        tombstonesCreated += this.deleteEntity(
+          "trigger",
+          triggerId,
+          triggerSelector,
+          revision,
+          deletedAt,
+          deleted,
+          seen,
+        );
+      }
+      const calibrationRows = this.database.prepare("SELECT * FROM calibration_patterns").all() as Row[];
+      for (const calibrationRow of calibrationRows) {
+        const patternId = String(calibrationRow.pattern_id);
+        const calibration = this.open<CalibrationPatternRecord>(
+          "calibration_pattern",
+          patternId,
+          String(calibrationRow.encrypted_payload),
+        );
+        if (!this.valueReferencesAnyIdentifier(calibration.pattern, artifactIds)) continue;
+        const calibrationSelector: ForgetSelector = { userId: cluster.scope.userId };
+        if (selector.reason !== undefined) calibrationSelector.reason = selector.reason;
+        tombstonesCreated += this.deleteEntity(
+          "calibration_pattern",
+          patternId,
+          calibrationSelector,
+          revision,
+          deletedAt,
+          deleted,
+          seen,
+        );
+      }
+      this.deleteLearningJobsReferencing(cluster.scope, artifactIds, deleted);
+    }
+
+    if (row && entityType === "trigger") {
+      this.database.prepare("DELETE FROM trigger_activations WHERE trigger_id = ?").run(entityId);
+    }
+    if (row && "user_id" in row) {
+      const rowScope: ScopeRef = { userId: String(row.user_id) };
+      if (typeof row.workspace_id === "string") rowScope.workspaceId = row.workspace_id;
+      if (typeof row.session_id === "string") rowScope.sessionId = row.session_id;
+      this.deleteLearningJobsReferencing(rowScope, [entityId], deleted);
+      if (["source_event", "world_claim", "correction"].includes(entityType)) {
+        const relationDelete = this.database.prepare(`
+          DELETE FROM entity_edges
+          WHERE user_id = ?
+            AND ((? IS NULL AND workspace_id IS NULL) OR workspace_id = ?)
+            AND from_type = 'entity' AND to_type = 'entity'
+        `).run(rowScope.userId, rowScope.workspaceId ?? null, rowScope.workspaceId ?? null);
+        if (relationDelete.changes > 0) {
+          deleted.entity_relation = (deleted.entity_relation ?? 0) + relationDelete.changes;
+        }
+      }
+    }
+
     if (row && descriptor) {
       if (entityType === "source_event") {
         this.database.prepare("DELETE FROM source_events_fts WHERE event_id = ?").run(entityId);
@@ -2165,6 +3249,7 @@ export class MemoryStore {
       }
       this.database.prepare("DELETE FROM source_links WHERE owner_type = ? AND owner_id = ?").run(entityType, entityId);
       this.database.prepare("DELETE FROM embeddings WHERE owner_type = ? AND owner_id = ?").run(entityType, entityId);
+      this.database.prepare("DELETE FROM embedding_buckets WHERE owner_type = ? AND owner_id = ?").run(entityType, entityId);
       this.database.prepare("DELETE FROM cache_entries WHERE owner_type = ? AND owner_id = ?").run(entityType, entityId);
       this.database.prepare(`
         DELETE FROM entity_edges
@@ -2216,7 +3301,41 @@ export class MemoryStore {
       case "trigger": return { table: "triggers", where: "trigger_id = ?", args: [entityId] };
       case "failure_cluster": return { table: "failure_clusters", where: "cluster_id = ?", args: [entityId] };
       case "calibration_pattern": return { table: "calibration_patterns", where: "pattern_id = ?", args: [entityId] };
+      case "session": return { table: "session_lifecycle", where: "session_id = ?", args: [entityId] };
       default: throw new TypeError(`Unsupported forget entity type: ${entityType}`);
+    }
+  }
+
+  private failureClusterReferencesCorrection(cluster: FailureClusterRecord, correctionId: string): boolean {
+    if (cluster.correctionIds.includes(correctionId)) return true;
+    if (cluster.signature === null || typeof cluster.signature !== "object" || Array.isArray(cluster.signature)) return false;
+    const selfReflectionIds = (cluster.signature as Record<string, unknown>).selfReflectionIds;
+    return Array.isArray(selfReflectionIds) && selfReflectionIds.includes(correctionId);
+  }
+
+  private valueReferencesAnyIdentifier(value: unknown, identifiers: readonly string[]): boolean {
+    if (identifiers.length === 0) return false;
+    const serialized = canonicalJson(value);
+    return identifiers.some((identifier) => serialized.includes(identifier));
+  }
+
+  private deleteLearningJobsReferencing(
+    scope: ScopeRef,
+    identifiers: readonly string[],
+    deleted: Record<string, number>,
+  ): void {
+    if (identifiers.length === 0) return;
+    const rows = this.database.prepare(`
+      SELECT * FROM learning_jobs
+      WHERE user_id = ? AND (workspace_id IS NULL OR workspace_id = ?)
+    `).all(scope.userId, scope.workspaceId ?? null) as Row[];
+    const remove = this.database.prepare("DELETE FROM learning_jobs WHERE job_id = ?");
+    for (const row of rows) {
+      const job = this.decodeLearningJob(row);
+      if (!this.valueReferencesAnyIdentifier(job, identifiers)) continue;
+      if (remove.run(job.jobId).changes > 0) {
+        deleted.learning_job = (deleted.learning_job ?? 0) + 1;
+      }
     }
   }
 
@@ -2305,16 +3424,62 @@ export class MemoryStore {
   }
 
   private assertImportUsers(payload: ExportPackage, allowDifferentUser: boolean): void {
-    if (allowDifferentUser) return;
     const packageUsers = new Set<string>();
-    for (const record of payload.records.sourceEvents ?? []) packageUsers.add(record.value.scope.userId);
-    for (const record of payload.records.turns ?? []) packageUsers.add(record.scope.userId);
-    for (const record of payload.records.worldClaims ?? []) packageUsers.add(record.scope.userId);
-    for (const record of payload.records.policies ?? []) packageUsers.add(record.scope.userId);
-    for (const record of payload.records.episodes ?? []) packageUsers.add(record.scope.userId);
+    const incomingEvents = new Map(
+      (payload.records.sourceEvents ?? []).map((record) => [record.value.eventId, record.value] as const),
+    );
+    const addScope = (scope: Pick<ScopeRef, "userId">): void => {
+      packageUsers.add(scope.userId);
+    };
+    const validateArtifactSources = (
+      artifact: string,
+      refs: readonly SourceRef[],
+      required: boolean,
+    ): void => {
+      if (required && refs.length === 0) {
+        throw new ProtocolError({
+          code: "SCOPE_DENIED",
+          message: `${artifact} has no authoritative SourceRef and cannot be attributed during import`,
+        });
+      }
+      for (const ref of refs) {
+        const event = incomingEvents.get(ref.eventId) ?? this.getSourceEvent(ref.eventId);
+        if (event === undefined) {
+          throw new ProtocolError({
+            code: "SCOPE_DENIED",
+            message: `${artifact} references source event ${ref.eventId} outside the import package and local store`,
+          });
+        }
+        this.assertSourceRef(ref, event);
+        addScope(event.scope);
+      }
+    };
+
+    for (const record of payload.records.sourceEvents ?? []) addScope(record.value.scope);
+    for (const record of payload.records.turns ?? []) addScope(record.scope);
+    for (const record of payload.records.worldClaims ?? []) addScope(record.scope);
+    for (const record of payload.records.policies ?? []) addScope(record.scope);
+    for (const record of payload.records.episodes ?? []) addScope(record.scope);
+    for (const record of payload.records.corrections ?? []) addScope(record.scope);
+    for (const record of payload.records.traces ?? []) addScope(record.scope);
+    for (const record of payload.records.triggers ?? []) {
+      addScope(record.scope);
+      validateArtifactSources(
+        `Trigger ${record.triggerId}`,
+        record.sourceRefs ?? [],
+        record.learnedFromClusterId !== undefined,
+      );
+    }
+    for (const record of payload.records.failureClusters ?? []) addScope(record.scope);
+    for (const record of payload.records.sessions ?? []) addScope(record.scope);
+    for (const record of payload.records.triggerActivations ?? []) addScope(record.scope);
+    for (const record of payload.records.calibrationPatterns ?? []) {
+      validateArtifactSources(`Calibration ${record.patternId}`, record.sourceRefs ?? [], true);
+    }
     for (const record of payload.records.tombstones ?? []) {
       if (typeof record.user_id === "string") packageUsers.add(record.user_id);
     }
+    if (allowDifferentUser) return;
     if (packageUsers.size > 1) {
       throw new ProtocolError({ code: "SCOPE_DENIED", message: "Import contains more than one user scope" });
     }
@@ -2322,9 +3487,16 @@ export class MemoryStore {
       SELECT DISTINCT user_id FROM (
         SELECT user_id FROM source_events
         UNION ALL SELECT user_id FROM turns
+        UNION ALL SELECT user_id FROM observations
         UNION ALL SELECT user_id FROM world_claims
         UNION ALL SELECT user_id FROM policies
         UNION ALL SELECT user_id FROM episodes
+        UNION ALL SELECT user_id FROM corrections
+        UNION ALL SELECT user_id FROM turn_traces
+        UNION ALL SELECT user_id FROM triggers
+        UNION ALL SELECT user_id FROM failure_clusters
+        UNION ALL SELECT user_id FROM session_lifecycle
+        UNION ALL SELECT user_id FROM trigger_activations
         UNION ALL SELECT user_id FROM tombstones
       ) LIMIT 2
     `).all() as Row[];

@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 6;
 
 const MIGRATIONS: readonly string[] = [
   `
@@ -289,6 +289,77 @@ const MIGRATIONS: readonly string[] = [
   `
   ALTER TABLE turns ADD COLUMN branch TEXT;
   ALTER TABLE turns ADD COLUMN commit_hash TEXT;
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS session_lifecycle (
+    session_id TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL,
+    user_id TEXT NOT NULL,
+    workspace_id TEXT,
+    status TEXT NOT NULL CHECK(status IN ('active', 'ended')),
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    end_idempotency_key TEXT UNIQUE,
+    record_hash TEXT NOT NULL
+  ) STRICT;
+  CREATE INDEX IF NOT EXISTS session_lifecycle_scope_idx
+    ON session_lifecycle(user_id, workspace_id, status, revision);
+
+  CREATE TABLE IF NOT EXISTS trigger_activations (
+    activation_id TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL,
+    trigger_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL REFERENCES turns(turn_id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL,
+    workspace_id TEXT,
+    session_id TEXT,
+    structural_score REAL NOT NULL,
+    similarity_score REAL NOT NULL,
+    effective_score REAL NOT NULL,
+    activated_at TEXT NOT NULL,
+    UNIQUE(trigger_id, turn_id)
+  ) STRICT;
+  CREATE INDEX IF NOT EXISTS trigger_activations_trigger_idx
+    ON trigger_activations(trigger_id, activated_at);
+
+  CREATE TABLE IF NOT EXISTS learning_jobs (
+    job_id TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    user_id TEXT NOT NULL,
+    workspace_id TEXT,
+    session_id TEXT,
+    job_type TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'completed', 'failed')),
+    attempts INTEGER NOT NULL,
+    available_at TEXT NOT NULL,
+    leased_at TEXT,
+    last_error TEXT,
+    encrypted_payload TEXT NOT NULL,
+    record_hash TEXT NOT NULL
+  ) STRICT;
+  CREATE INDEX IF NOT EXISTS learning_jobs_queue_idx
+    ON learning_jobs(status, available_at, revision);
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS embedding_buckets (
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    bucket TEXT NOT NULL,
+    owner_type TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    PRIMARY KEY(provider, model, bucket, owner_type, owner_id)
+  ) STRICT;
+  CREATE INDEX IF NOT EXISTS embedding_buckets_lookup_idx
+    ON embedding_buckets(provider, model, bucket, owner_type, owner_id);
+  CREATE INDEX IF NOT EXISTS embedding_buckets_owner_idx
+    ON embedding_buckets(owner_type, owner_id, provider, model);
+  `,
+  `
+  CREATE INDEX IF NOT EXISTS entity_edges_owner_idx
+    ON entity_edges(to_type, to_id, relation);
+  CREATE INDEX IF NOT EXISTS entity_edges_scope_from_idx
+    ON entity_edges(user_id, workspace_id, from_type, from_id, to_type, to_id, relation);
   `,
 ];
 

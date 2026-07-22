@@ -1,10 +1,13 @@
 import type {
   BeginTurnInput,
+  BuildWorksetInput,
   CheckpointEvidenceInput,
   CheckpointEvidenceResult,
   CompleteTurnInput,
   CompleteTurnResult,
   CorrectionInput,
+  EndSessionInput,
+  EndSessionResult,
   MemoryBundle,
   RecallInput,
   RecordEventInput,
@@ -77,6 +80,17 @@ export class MemoryClient {
       method: "POST",
       body: JSON.stringify(input),
     });
+  }
+
+  buildWorkset(input: BuildWorksetInput): Promise<MemoryBundle> {
+    return this.request(`/v1/turns/${encodeURIComponent(input.turnId)}/workset`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  endSession(input: EndSessionInput): Promise<EndSessionResult> {
+    return this.request("/v1/sessions/end", { method: "POST", body: JSON.stringify(input) });
   }
 
   getSources(turnId: string, sourceRefs: readonly SourceRef[]): Promise<SourceEvent[]> {

@@ -64,7 +64,7 @@ export const ObservationSchema = z.object({
       eventId: z.string().optional(),
       sessionId: z.string().optional(),
       contentHash: z.string().optional(),
-      capturedAt: z.string().optional(),
+      capturedAt: z.iso.datetime().optional(),
       workspaceId: z.string().optional(),
       startOffset: z.number().int().nonnegative().optional(),
       endOffset: z.number().int().nonnegative().optional(),
@@ -84,6 +84,7 @@ export const RetrievalStageSchema = z.enum([
   "policy",
   "current_evidence",
   "world",
+  "reexperience",
   "episode",
   "source_expansion",
 ]);
@@ -92,15 +93,30 @@ export const RecallSchema = z.object({
   turnId: z.string().min(1),
   stage: RetrievalStageSchema,
   query: z.string(),
-  budgetTokens: z.number().int().positive().optional(),
+  budgetTokens: z.number().int().positive().max(8_000).optional(),
   cursor: z.string().optional(),
+  recentTurns: z.number().int().min(20).max(50).optional(),
+});
+
+export const BuildWorksetSchema = z.object({
+  turnId: z.string().min(1),
+  query: z.string(),
+  budgetTokens: z.number().int().positive().max(8_000).optional(),
+  recentTurns: z.number().int().min(20).max(50).optional(),
+  cursor: z.string().optional(),
+});
+
+export const EndSessionSchema = z.object({
+  scope: TurnScopeSchema,
+  endedAt: z.iso.datetime().optional(),
+  idempotencyKey: z.string().min(1),
 });
 
 export const SourceRefSchema = z.object({
   eventId: z.string().min(1),
   sessionId: z.string().min(1),
   contentHash: z.string().min(1),
-  capturedAt: z.string().min(1),
+  capturedAt: z.iso.datetime(),
   workspaceId: z.string().optional(),
   startOffset: z.number().int().nonnegative().optional(),
   endOffset: z.number().int().nonnegative().optional(),
@@ -119,6 +135,7 @@ export const CorrectionSchema = z.object({
   scopeLevel: z.enum(["user", "workspace", "session"]).optional(),
   explicit: z.boolean(),
   idempotencyKey: z.string().min(1),
+  origin: z.enum(["user_correction", "self_reflection"]).optional(),
 });
 
 export const VerifierResultSchema = z.object({

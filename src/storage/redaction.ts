@@ -72,7 +72,18 @@ export function redactSensitiveValue<T>(input: T): RedactionResult<T> {
   const redactions = new Set<string>();
 
   const visit = (value: unknown, key?: string): unknown => {
-    if (key && SENSITIVE_KEY.test(key)) {
+    // A field name can describe a non-secret signal (for example
+    // `containsSecretMaterial: false`). Preserve boolean control values so
+    // redaction cannot change the type or semantics of persisted features.
+    // All non-boolean values under credential-like keys remain fully redacted,
+    // in addition to the content-pattern filtering below.
+    if (
+      key
+      && SENSITIVE_KEY.test(key)
+      && typeof value !== "boolean"
+      && value !== null
+      && value !== undefined
+    ) {
       redactions.add(`metadata:${key}`);
       return `${REDACTED}:sensitive_field`;
     }

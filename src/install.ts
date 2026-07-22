@@ -83,6 +83,13 @@ function appendRawText(path: string, content: string, result: InstallResult): vo
   (existed ? result.updated : result.written).push(path);
 }
 
+function hasTomlTable(config: string, table: "features" | "memories" | "mcp_servers.memoryd"): boolean {
+  if (table === "mcp_servers.memoryd") {
+    return /^\s*\[\s*mcp_servers\s*\.\s*(?:memoryd|"memoryd")\s*\]\s*(?:#.*)?$/m.test(config);
+  }
+  return new RegExp(`^\\s*\\[\\s*${table}\\s*\\]\\s*(?:#.*)?$`, "m").test(config);
+}
+
 function installSkills(destination: string, result: InstallResult): void {
   const source = join(packageRoot(), "integrations", "shared", "skills");
   mkdirSync(destination, { recursive: true });
@@ -163,16 +170,31 @@ function installCodex(root: string, scope: InstallScope, result: InstallResult):
   const configPath = join(codexRoot, "config.toml");
   const config = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
   const snippets: string[] = [];
-  if (!/^\[mcp_servers\.memoryd\]$/m.test(config)) {
+  if (!hasTomlTable(config, "mcp_servers.memoryd")) {
     snippets.push('[mcp_servers.memoryd]\ncommand = "memory-mcp"\nrequired = true\nstartup_timeout_sec = 10.0\ntool_timeout_sec = 30.0');
+  } else {
+    result.notes.push(
+      `Existing [mcp_servers.memoryd] table was preserved in ${configPath}; verify command, required, and timeout settings.`,
+    );
   }
-  if (!/^\[features\]$/m.test(config)) snippets.push("[features]\nmemories = false\nhooks = true");
-  if (!/^\[memories\]$/m.test(config)) snippets.push("[memories]\ngenerate_memories = false\nuse_memories = false");
+  if (!hasTomlTable(config, "features")) {
+    snippets.push("[features]\nmemories = false\nhooks = true");
+  } else {
+    result.notes.push(
+      `Existing [features] table was preserved in ${configPath}; verify hooks=true and memories=false.`,
+    );
+  }
+  if (!hasTomlTable(config, "memories")) {
+    snippets.push("[memories]\ngenerate_memories = false\nuse_memories = false");
+  } else {
+    result.notes.push(
+      `Existing [memories] table was preserved in ${configPath}; verify generate_memories=false and use_memories=false.`,
+    );
+  }
   if (snippets.length > 0) {
     appendRawText(configPath, snippets.join("\n\n"), result);
   } else {
     result.skipped.push(configPath);
-    result.notes.push(`Verify that memories are disabled and hooks are enabled in ${configPath}; existing TOML tables were preserved.`);
   }
   installSkills(scope === "user" ? join(root, ".agents", "skills") : join(root, ".agents", "skills"), result);
 }

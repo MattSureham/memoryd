@@ -13,6 +13,7 @@ export interface RuntimeConfig {
   port: number;
   bearerToken?: string;
   deviceId: string;
+  learningIntervalMs: number;
 }
 
 function expandHome(path: string): string {
@@ -35,6 +36,13 @@ function persistentDeviceId(home: string): string {
   }
 }
 
+function integerAtLeast(value: string | undefined, fallback: number, minimum: number): number {
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) return fallback;
+  return Math.max(minimum, parsed);
+}
+
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): RuntimeConfig {
   const home = expandHome(environment.MEMORYD_HOME ?? "~/.memoryd");
   mkdirSync(home, { recursive: true, mode: 0o700 });
@@ -49,6 +57,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Runtim
     port: Number.parseInt(environment.MEMORYD_PORT ?? "7337", 10),
     ...(environment.MEMORYD_TOKEN === undefined ? {} : { bearerToken: environment.MEMORYD_TOKEN }),
     deviceId: environment.MEMORYD_DEVICE_ID ?? persistentDeviceId(home),
+    learningIntervalMs: integerAtLeast(environment.MEMORYD_LEARNING_INTERVAL_MS, 5_000, 1_000),
   };
 }
 

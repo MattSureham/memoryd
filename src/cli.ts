@@ -5,8 +5,17 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { clientFromEnvironment } from "./client.js";
 import { loadConfig, loadOrCreateMasterKey, resolveWorkspaceIdentity } from "./config.js";
-import { readHookPayload, replayHookSpool, runHook, type HookEvent, type HookVendor } from "./adapters/hook.js";
+import {
+  formatHookOutput,
+  readHookPayload,
+  replayHookSpool,
+  runHook,
+  type HookEvent,
+  type HookVendor,
+} from "./adapters/hook.js";
 import { installAdapters, type InstallScope, type InstallTarget } from "./install.js";
+import { resolvePolicyDependencies } from "./core/index.js";
+import { MemoryRuntime } from "./runtime.js";
 import { MemoryStore, type ForgetSelector, type StoredPolicy } from "./storage/index.js";
 
 function option(args: string[], name: string): string | undefined {
@@ -24,9 +33,10 @@ function output(value: unknown): void {
 
 function usage(): never {
   process.stderr.write(`memoryctl commands:
-  start | stop | doctor | replay
+  start | stop | doctor | replay | learn --once
   inspect [id] [--all]
   approve <policy-id> | revoke <policy-id>
+  calibration retire <pattern-id>
   forget <entity-type> <entity-id> --reason <text>
   export <file> [--passphrase <text>]
   import <file> [--passphrase <text>]
@@ -126,6 +136,8 @@ function inspect(id: string | undefined, includeAll: boolean): void {
       corrections: store.listCorrections(scope, administrative),
       failureClusters: store.listFailureClusters(scope),
       triggers: store.listTriggers(scope, administrative),
+      calibrationPatterns: store.listCalibrationPatternsForScope(scope, administrative),
+      learningJobs: store.listLearningJobs(undefined, scope),
     };
     if (id === undefined) output(data);
     else {
@@ -159,7 +171,41 @@ function changePolicy(policyId: string, status: "approved" | "revoked"): void {
       reviewStatus: status,
       authority: current.authority,
     };
-    output(store.putPolicy(next, `${status}:${policyId}:${next.version}`));
+    if (status === "approved") {
+      const graph = resolvePolicyDependencies([
+        ...store.listPolicies(current.scope, true, true).filter((policy) => policy.policyId !== policyId),
+        next,
+      ]);
+      const dependency = graph.get(policyId);
+      if ((dependency?.cyclic.length ?? 0) > 0) {
+        throw new Error(`Policy dependency cycle: ${dependency?.cyclic.join(", ")}`);
+      }
+    }
+    const written = store.putPolicy(next, `${status}:${policyId}:${next.version}`);
+    for (const trigger of store.listTriggers(current.scope, true).filter((item) => item.policyId === policyId)) {
+      store.upsertTrigger({ ...trigger, status: status === "approved" ? "active" : "retired" });
+    }
+    output(written);
+  } finally {
+    store.close();
+  }
+}
+
+function retireCalibration(patternId: string): void {
+  const store = openStore();
+  try {
+    const pattern = store.getCalibrationPattern(patternId);
+    if (pattern === undefined) throw new Error(`Calibration pattern ${patternId} was not found`);
+    output(store.upsertCalibrationPattern({ ...pattern, status: "retired" }));
+  } finally {
+    store.close();
+  }
+}
+
+function learnOnce(): void {
+  const store = openStore();
+  try {
+    output(new MemoryRuntime(store).runLearning(currentScope()));
   } finally {
     store.close();
   }
@@ -207,9 +253,13 @@ async function main(args = process.argv.slice(2)): Promise<void> {
   if (command === "stop") return stop();
   if (command === "doctor") return await doctor();
   if (command === "replay") return output(await replayHookSpool());
+  if (command === "learn" && has(args, "--once")) return learnOnce();
   if (command === "inspect") return inspect(args[1], has(args, "--all"));
   if (command === "approve" && args[1] !== undefined) return changePolicy(args[1], "approved");
   if (command === "revoke" && args[1] !== undefined) return changePolicy(args[1], "revoked");
+  if (command === "calibration" && args[1] === "retire" && args[2] !== undefined) {
+    return retireCalibration(args[2]);
+  }
   if (command === "forget" && args[1] !== undefined && args[2] !== undefined) {
     const reason = option(args, "--reason");
     if (reason === undefined) throw new Error("forget requires --reason");
@@ -220,7 +270,9 @@ async function main(args = process.argv.slice(2)): Promise<void> {
   if (command === "reindex") {
     const store = openStore();
     try {
-      return output(store.reindex());
+      const base = store.reindex();
+      const derived = new MemoryRuntime(store).rebuildDerivedIndexes(currentScope(), true);
+      return output({ ...base, derived });
     } finally {
       store.close();
     }
@@ -239,7 +291,8 @@ async function main(args = process.argv.slice(2)): Promise<void> {
     if (event === "session-start" && !result.includes("memoryd unavailable")) {
       await replayHookSpool();
     }
-    if (result.length > 0) process.stdout.write(`${result}\n`);
+    const hookOutput = formatHookOutput(vendor, event, result);
+    if (hookOutput.length > 0) process.stdout.write(`${hookOutput}\n`);
     return;
   }
   usage();

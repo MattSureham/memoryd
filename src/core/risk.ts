@@ -18,6 +18,7 @@ export interface RecognizeRiskOptions {
   classifier?: RiskClassifier;
   timeoutMs?: number;
   calibration?: Partial<Record<RiskCode, number>>;
+  trigger?: Partial<Record<RiskCode, number>>;
 }
 
 const RISK_CODES: RiskCode[] = [
@@ -131,6 +132,13 @@ export async function recognizeRisks(
     const score = options.calibration?.[code];
     if (score !== undefined && clampScore(score) > 0) {
       add(contributions, code, score, "agent-profile calibration overlay", "calibration");
+    }
+  }
+
+  for (const code of RISK_CODES) {
+    const score = options.trigger?.[code];
+    if (score !== undefined && clampScore(score) > 0) {
+      add(contributions, code, score, "matched learned Trigger", "trigger");
     }
   }
 

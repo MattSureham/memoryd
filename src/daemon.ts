@@ -20,8 +20,17 @@ export function startDaemon(): { close: () => Promise<void> } {
   server.listen(config.port, config.host, () => {
     console.error(`memoryd listening on http://${config.host}:${config.port}`);
   });
+  const learningTimer = setInterval(() => {
+    try {
+      runtime.processLearningJobs(25);
+    } catch (error) {
+      console.error(`memoryd learning worker: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, config.learningIntervalMs);
+  learningTimer.unref();
 
   const close = async (): Promise<void> => {
+    clearInterval(learningTimer);
     await new Promise<void>((resolve, reject) => {
       server.close((error) => (error === undefined ? resolve() : reject(error)));
     });

@@ -53,6 +53,22 @@ const HOOK_ORDER: Record<HookEvent, number> = {
   "session-end": 6,
 };
 
+/**
+ * Translate memoryd's host-neutral hook feedback into the output contract of
+ * the configured host. Claude Code and Codex only continue a Stop hook when
+ * the hook emits a structured block decision; plain text is not a continuation
+ * request for Claude and is invalid Stop output for Codex. Generic wrappers
+ * retain the existing plain-text contract because there is no shared lifecycle
+ * hook output schema across other Agent hosts.
+ */
+export function formatHookOutput(vendor: HookVendor, event: HookEvent, message: string): string {
+  if (message.length === 0) return "";
+  if (event === "stop" && vendor !== "generic") {
+    return JSON.stringify({ decision: "block", reason: message });
+  }
+  return message;
+}
+
 function stringField(payload: HookPayload, ...keys: string[]): string | undefined {
   for (const key of keys) {
     const value = payload[key];
@@ -97,7 +113,7 @@ function profile(vendor: HookVendor, payload: HookPayload): AgentProfile {
   };
 }
 
-function makeScope(payload: HookPayload): { scope: ScopeRef; sessionId: string } {
+function makeScope(payload: HookPayload): { scope: ScopeRef & { sessionId: string }; sessionId: string } {
   const config = loadConfig();
   const cwd = stringField(payload, "cwd", "workdir", "workspace_root") ?? process.cwd();
   const workspace = resolveWorkspaceIdentity(cwd, loadOrCreateMasterKey(config.keyPath));
@@ -269,6 +285,21 @@ export async function runHook(
       });
       if (completed.verifier.status === "retry") {
         return `[memoryd verifier] ${completed.verifier.message ?? "Retry once with stricter evidence."}`;
+      }
+      return "";
+    }
+
+    if (event === "session-end") {
+      const endedAt = stringField(payload, "ended_at", "endedAt", "timestamp");
+      await client.endSession({
+        scope,
+        ...(endedAt === undefined ? {} : { endedAt }),
+        idempotencyKey: idempotency(vendor, event, sessionId, payload),
+      });
+      try {
+        unlinkSync(path);
+      } catch {
+        // State cleanup is best effort; the lifecycle endpoint is idempotent.
       }
       return "";
     }

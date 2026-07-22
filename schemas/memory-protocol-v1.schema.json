@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://memoryd.local/schema/memory-protocol-v1.schema.json",
-  "title": "memoryd protocol v1.0",
+  "title": "memoryd protocol v1.1",
   "description": "Canonical request and response types shared by MCP, HTTP and CLI adapters.",
   "$defs": {
     "ScopeRef": {
@@ -124,7 +124,7 @@
             "additionalProperties": false,
             "required": ["source", "score", "reason"],
             "properties": {
-              "source": { "enum": ["rule", "classifier", "calibration"] },
+              "source": { "enum": ["rule", "classifier", "calibration", "trigger"] },
               "score": { "type": "number", "minimum": 0, "maximum": 1 },
               "reason": { "type": "string" }
             }
@@ -148,12 +148,90 @@
         "sources": { "type": "array", "items": { "$ref": "#/$defs/SourceRef" } }
       }
     },
+    "PolicyScheduleEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policyId", "version", "tier", "reason"],
+      "properties": {
+        "policyId": { "type": "string" },
+        "version": { "type": "integer", "minimum": 1 },
+        "tier": { "enum": ["L1", "L2", "L3", "Archive"] },
+        "reason": { "type": "string" },
+        "triggerIds": { "type": "array", "items": { "type": "string" } },
+        "dependencies": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "PolicySchedule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["l1", "l2", "l3", "archive", "dependencyErrors"],
+      "properties": {
+        "l1": { "type": "array", "items": { "$ref": "#/$defs/PolicyScheduleEntry" } },
+        "l2": { "type": "array", "items": { "$ref": "#/$defs/PolicyScheduleEntry" } },
+        "l3": { "type": "array", "items": { "$ref": "#/$defs/PolicyScheduleEntry" } },
+        "archive": { "type": "array", "items": { "$ref": "#/$defs/PolicyScheduleEntry" } },
+        "dependencyErrors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["policyId", "kind"],
+            "properties": {
+              "policyId": { "type": "string" },
+              "kind": { "enum": ["missing", "cycle", "inactive"] },
+              "dependencyId": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "PlanRetrievalSignal": {
+      "enum": ["bm25", "embedding", "entity", "temporal", "thread"]
+    },
+    "PlanRetrievalStrategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategyId", "riskCodes", "orderedSteps", "weights", "sourceCoverageWeight", "minimumEvidenceCoverage", "checkpointFirst", "originalSourceRequired", "sameWorkspaceOnly", "allowEmbedding"],
+      "properties": {
+        "strategyId": { "type": "string", "minLength": 1 },
+        "riskCodes": {
+          "type": "array",
+          "items": {
+            "enum": ["entity_or_symbol_merge", "stale_source", "wrong_workspace", "cross_session_merge", "unsupported_inference", "narrative_completion", "destructive_action", "secret_exposure"]
+          }
+        },
+        "orderedSteps": {
+          "type": "array",
+          "items": {
+            "enum": ["scope_filter", "redaction_filter", "policy", "current_evidence", "checkpoint", "exact_match", "bm25", "embedding", "timeline", "entity_graph", "thread", "complete_episode", "original_source", "conflict_check"]
+          }
+        },
+        "weights": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bm25", "embedding", "entity", "temporal", "thread"],
+          "properties": {
+            "bm25": { "type": "number", "minimum": 0 },
+            "embedding": { "type": "number", "minimum": 0 },
+            "entity": { "type": "number", "minimum": 0 },
+            "temporal": { "type": "number", "minimum": 0 },
+            "thread": { "type": "number", "minimum": 0 }
+          }
+        },
+        "sourceCoverageWeight": { "type": "number", "minimum": 0 },
+        "minimumEvidenceCoverage": { "type": "number", "minimum": 0, "maximum": 1 },
+        "checkpointFirst": { "type": "boolean" },
+        "originalSourceRequired": { "type": "boolean" },
+        "sameWorkspaceOnly": { "type": "boolean" },
+        "allowEmbedding": { "type": "boolean" }
+      }
+    },
     "TurnPlan": {
       "type": "object",
       "additionalProperties": false,
       "required": ["protocolVersion", "turnId", "snapshotRevision", "agentProfileKey", "risks", "modes", "retrievalStages", "gate", "activePolicies", "enforcementLevel", "retryCount", "createdAt"],
       "properties": {
-        "protocolVersion": { "const": "1.0" },
+        "protocolVersion": { "const": "1.1" },
         "turnId": { "type": "string" },
         "snapshotRevision": { "type": "integer", "minimum": 0 },
         "agentProfileKey": { "type": "string" },
@@ -195,13 +273,15 @@
           }
         },
         "activePolicies": { "type": "array", "items": { "$ref": "#/$defs/PolicyRef" } },
+        "policySchedule": { "$ref": "#/$defs/PolicySchedule" },
+        "retrievalStrategy": { "$ref": "#/$defs/PlanRetrievalStrategy" },
         "enforcementLevel": { "enum": ["enforced", "advisory"] },
         "retryCount": { "type": "integer", "minimum": 0, "maximum": 1 },
         "createdAt": { "type": "string", "format": "date-time" }
       }
     },
     "ModeLevel": { "enum": ["off", "low", "medium", "high", "blocked"] },
-    "RetrievalStageName": { "enum": ["policy", "current_evidence", "world", "episode", "source_expansion"] },
+    "RetrievalStageName": { "enum": ["policy", "current_evidence", "world", "reexperience", "episode", "source_expansion"] },
     "Observation": {
       "type": "object",
       "additionalProperties": false,
@@ -262,7 +342,55 @@
         "participants": { "type": "array", "items": { "type": "string" } },
         "tags": { "type": "array", "items": { "type": "string" } },
         "startedAt": { "type": "string", "format": "date-time" },
-        "endedAt": { "type": "string", "format": "date-time" }
+        "endedAt": { "type": "string", "format": "date-time" },
+        "turnIds": { "type": "array", "items": { "type": "string" } },
+        "topicKey": { "type": "string" },
+        "boundaryReason": { "enum": ["new_session", "topic_shift", "correction", "time_gap", "size_limit", "explicit"] },
+        "salience": { "type": "number" },
+        "emotionTags": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "MemoryReexperiencePack": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["recentSourceRefs", "recentEvents", "historicalEpisodes", "historicalEvents", "keyEventRefs", "keyEvents", "emotionalEventRefs", "emotionalEvents", "correctionSourceRefs", "corrections", "factConstraints", "window"],
+      "properties": {
+        "recentSourceRefs": { "type": "array", "items": { "$ref": "#/$defs/SourceRef" } },
+        "recentEvents": { "type": "array", "items": { "$ref": "#/$defs/SourceEvent" } },
+        "historicalEpisodes": { "type": "array", "items": { "$ref": "#/$defs/EpisodeMemory" } },
+        "historicalEvents": { "type": "array", "items": { "$ref": "#/$defs/SourceEvent" } },
+        "keyEventRefs": { "type": "array", "items": { "$ref": "#/$defs/SourceRef" } },
+        "keyEvents": { "type": "array", "items": { "$ref": "#/$defs/SourceEvent" } },
+        "emotionalEventRefs": { "type": "array", "items": { "$ref": "#/$defs/SourceRef" } },
+        "emotionalEvents": { "type": "array", "items": { "$ref": "#/$defs/SourceEvent" } },
+        "correctionSourceRefs": { "type": "array", "items": { "$ref": "#/$defs/SourceRef" } },
+        "corrections": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["correctionId", "wrongStatement", "correction", "source"],
+            "properties": {
+              "correctionId": { "type": "string" },
+              "wrongStatement": { "type": "string" },
+              "correction": { "type": "string" },
+              "lesson": { "type": "string" },
+              "source": { "$ref": "#/$defs/SourceRef" }
+            }
+          }
+        },
+        "factConstraints": { "type": "array", "items": { "$ref": "#/$defs/WorldClaim" } },
+        "window": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["requestedTurns", "includedTurns"],
+          "properties": {
+            "requestedTurns": { "type": "integer", "minimum": 0 },
+            "includedTurns": { "type": "integer", "minimum": 0 },
+            "startedAt": { "type": "string", "format": "date-time" },
+            "endedAt": { "type": "string", "format": "date-time" }
+          }
+        }
       }
     },
     "MemoryBundle": {
@@ -270,7 +398,7 @@
       "additionalProperties": false,
       "required": ["protocolVersion", "turnId", "snapshotRevision", "indexRevision", "stage", "worldClaims", "episodes", "sourceRefs", "policies", "counterexamples", "conflicts", "sourceCoverage", "trace", "untrustedEvidenceNotice"],
       "properties": {
-        "protocolVersion": { "const": "1.0" },
+        "protocolVersion": { "const": "1.1" },
         "turnId": { "type": "string" },
         "snapshotRevision": { "type": "integer", "minimum": 0 },
         "indexRevision": { "type": "integer", "minimum": 0 },
@@ -295,6 +423,7 @@
           }
         },
         "conflicts": { "type": "array", "items": { "$ref": "#/$defs/WorldClaim" } },
+        "reexperiencePack": { "$ref": "#/$defs/MemoryReexperiencePack" },
         "sourceCoverage": { "type": "number", "minimum": 0, "maximum": 1 },
         "trace": {
           "type": "object",
@@ -305,7 +434,10 @@
             "strategies": { "type": "array", "items": { "type": "string" } },
             "candidateCount": { "type": "integer", "minimum": 0 },
             "returnedCount": { "type": "integer", "minimum": 0 },
-            "nextCursor": { "type": "string" }
+            "nextCursor": { "type": "string" },
+            "strategyId": { "type": "string" },
+            "rankingSignals": { "type": "array", "items": { "$ref": "#/$defs/PlanRetrievalSignal" } },
+            "coverageReranked": { "type": "boolean" }
           }
         },
         "untrustedEvidenceNotice": { "type": "string" }
@@ -379,7 +511,35 @@
         "stage": { "$ref": "#/$defs/RetrievalStageName" },
         "query": { "type": "string" },
         "budgetTokens": { "type": "integer", "minimum": 1, "maximum": 8000 },
+        "cursor": { "type": "string" },
+        "recentTurns": { "type": "integer", "minimum": 20, "maximum": 50 }
+      }
+    },
+    "BuildWorksetRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["turnId", "query"],
+      "properties": {
+        "turnId": { "type": "string" },
+        "query": { "type": "string" },
+        "budgetTokens": { "type": "integer", "minimum": 1, "maximum": 8000 },
+        "recentTurns": { "type": "integer", "minimum": 20, "maximum": 50 },
         "cursor": { "type": "string" }
+      }
+    },
+    "EndSessionRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "idempotencyKey"],
+      "properties": {
+        "scope": {
+          "allOf": [
+            { "$ref": "#/$defs/ScopeRef" },
+            { "required": ["sessionId"] }
+          ]
+        },
+        "endedAt": { "type": "string", "format": "date-time" },
+        "idempotencyKey": { "type": "string", "minLength": 1 }
       }
     },
     "GetSourcesRequest": {
@@ -410,7 +570,8 @@
         "value": true,
         "scopeLevel": { "enum": ["user", "workspace", "session"] },
         "explicit": { "type": "boolean" },
-        "idempotencyKey": { "type": "string", "minLength": 1 }
+        "idempotencyKey": { "type": "string", "minLength": 1 },
+        "origin": { "enum": ["user_correction", "self_reflection"] }
       }
     },
     "CompleteTurnRequest": {
@@ -431,6 +592,8 @@
     { "$ref": "#/$defs/CheckpointEvidenceRequest" },
     { "$ref": "#/$defs/CheckpointEvidenceResult" },
     { "$ref": "#/$defs/RecallRequest" },
+    { "$ref": "#/$defs/BuildWorksetRequest" },
+    { "$ref": "#/$defs/EndSessionRequest" },
     { "$ref": "#/$defs/GetSourcesRequest" },
     { "$ref": "#/$defs/CorrectionRequest" },
     { "$ref": "#/$defs/CompleteTurnRequest" },

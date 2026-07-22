@@ -1,16 +1,17 @@
-# memoryd 协议 1.0
+# memoryd 协议 1.1
 
-本文是当前 HTTP 与 MCP 实现的使用说明。TypeScript 类型位于 `src/contracts.ts`，JSON Schema 位于 `schemas/memory-protocol-v1.schema.json`。
+本文说明当前 HTTP、MCP 和 CLI 接口。TypeScript 类型位于 [src/contracts.ts](../src/contracts.ts)，JSON Schema 位于 [schemas/memory-protocol-v1.schema.json](../schemas/memory-protocol-v1.schema.json)。当前协议版本为 `1.1`；Schema 文件名中的 `v1` 表示 major version，不表示 minor version。客户端应通过 handshake 校验精确版本和 capability。
 
 ## 1. 传输与约定
 
-- 协议版本固定为字符串 `"1.0"`。
-- HTTP 默认基址：`http://127.0.0.1:7337`。
+- 协议版本固定为字符串 `"1.1"`。
+- Wire client 必须使用精确的 `1.1` 版本。旧数据库中的 `1.0` TurnPlan 会在解密读取边界迁移为 `1.1`；新增计划字段均有确定性运行时 fallback。其他持久化协议版本会以 `VERSION_CONFLICT` fail closed，并要求开启新 turn。这是本地存储迁移，不代表 `1.0` wire protocol 兼容。
+- HTTP 默认基址为 `http://127.0.0.1:7337`。
 - MCP 使用 stdio；`memory-mcp` 通过 HTTP 调用已启动的 daemon。
 - JSON request body 最大 2 MiB。
-- 若设置 `MEMORYD_TOKEN`，所有 HTTP 路由都要求 `Authorization: Bearer <token>`；MCP client 会从同一环境变量读取 token。
-- 时间字段使用 ISO 8601 datetime；cursor 是不透明字符串。
-- 调用方必须为可重试写入提供稳定且非空的 `idempotencyKey`。
+- 若设置 `MEMORYD_TOKEN`，所有 HTTP 路由都要求 `Authorization: Bearer <token>`；MCP client 从同一环境变量读取 token。
+- 时间字段使用 ISO 8601 datetime；cursor 是不透明、query-bound 的 keyset token。
+- 可重试写入必须提供稳定且非空的 `idempotencyKey`。
 
 HTTP 成功时直接返回业务对象，不包 `data`。错误统一为：
 
@@ -18,13 +19,13 @@ HTTP 成功时直接返回业务对象，不包 `data`。错误统一为：
 {
   "error": {
     "code": "STAGE_BLOCKED",
-    "message": "episode recall is blocked until current evidence is checkpointed",
+    "message": "reexperience recall is blocked until current evidence is checkpointed",
     "details": {}
   }
 }
 ```
 
-MCP 成功结果同时提供 JSON 文本 content 和 `structuredContent.result`；失败返回 `isError: true`，文本中是相同的错误结构。
+MCP 成功结果同时提供 JSON 文本 `content` 和 `structuredContent.result`；失败返回 `isError:true`，文本中是相同错误结构。
 
 ## 2. 核心标识
 
@@ -40,14 +41,15 @@ interface ScopeRef {
 }
 ```
 
-作用域不是认证凭证。hook adapter 默认使用 `MEMORYD_USER_ID`（未设置时为 `local-default`），并用 Git remote 或真实路径与主密钥的 HMAC 生成 workspace ID。事件必须有 session ID；user/workspace 级 claim 和 policy 可以没有 session ID。
+scope 不是认证凭证。hook adapter 默认使用 `MEMORYD_USER_ID`（未设置时为 `local-default`），并用 Git remote 或真实路径与主密钥的 HMAC 生成 workspace ID。
 
 ACL 语义：
 
 - user ID 必须相同；
-- 当前 workspace 可读取同 workspace 和 user-scoped 记录；
-- 未提供 workspace 时只读取 user-scoped 记录；
-- World/Policy 的 session-scoped 记录只对同 session 可见；Episode 和 SourceEvent 可在同 workspace 跨 session 召回。
+- 当前 workspace 可读同 workspace 和 user-scoped 记录；没有 workspace 时只能读 user-scoped 记录；
+- WorldClaim、Policy 的 session scope 只对同 session 可见；
+- Episode 和 SourceEvent 可在同 workspace 跨 session 召回；
+- `begin_turn` 和 SessionEnd 必须有 session ID；结束后的 session ID 不能重新 begin。
 
 ### 2.2 AgentProfile
 
@@ -66,7 +68,7 @@ interface AgentProfile {
 }
 ```
 
-profile key 为 `family:version:model-or-unknown:toolsetDigest-or-unknown`。只有 `hooks` 和 `stageGates` 同时为真时，TurnPlan 标记为 `enforced`；否则为 `advisory`。
+profile key 为 `family:version:model-or-unknown:toolsetDigest-or-unknown`。Calibration 只作用于完全相同的 profile key。只有 `hooks` 和 `stageGates` 都为真时，TurnPlan 标记为 `enforced`；否则为 `advisory`。
 
 ### 2.3 SourceRef
 
@@ -84,36 +86,40 @@ interface SourceRef {
 }
 ```
 
-World claim、Episode 和 correction 使用 `SourceRef` 绑定来源。存储层会核对 event、session、workspace、hash、captured time 和合法 offset；不匹配返回 `VERSION_CONFLICT`。通过 `memory_get_sources` 展开的内容已经脱敏，仍必须视为不可信证据。
+WorldClaim、Episode、Policy、correction 和 Re-experience 内容用 SourceRef 绑定来源。存储层会核对 event、session、workspace、hash、captured time 和 offset；不匹配返回 `VERSION_CONFLICT`。`memory_get_sources` 展开的内容已经脱敏，仍必须视为不可信证据。
 
 ## 3. 标准调用顺序
 
 ```text
 memory_begin_turn
        │
+       ├─ TurnPlan: risks + Policy schedule + retrieval strategy
        ▼
-   TurnPlan.gate.required ?
+   gate.required ?
        │ yes
        ▼
 读取当前文件/图片/测试/命令
-memory_checkpoint_evidence → {plan, observations, evidenceRefs}
+memory_checkpoint_evidence
        │
        ▼
 memory_recall(stage 按 TurnPlan 顺序)
        │
+       ├─ 完整工作集 → memory_build_workset
        ├─ sourceRefs → memory_get_sources
        ├─ 用户纠错 → memory_submit_correction
        ▼
 memory_complete_turn
+       │
+       └─ host lifecycle/wrapper → POST /v1/sessions/end
 ```
 
-`world`、`episode` 和 `source_expansion` 在 gate required 且未 satisfied 时返回 `STAGE_BLOCKED`。`policy` 和 `current_evidence` 不被该 gate 阻塞。
+当 gate required 且未 satisfied 时，`world`、`episode`、`reexperience` 和 `source_expansion` 返回 `STAGE_BLOCKED`。`policy` 与 `current_evidence` 不受该 gate 阻塞。
 
 ## 4. MCP 工具
 
-管理操作没有 MCP 工具，只能显式使用 `memoryctl`。
+MCP 暴露七个模型侧工具。approve、revoke、forget、export/import、reindex、显式学习和 Calibration 退休只存在于 `memoryctl`。
 
-### `memory_begin_turn`
+### 4.1 `memory_begin_turn`
 
 MCP 输入是扁平结构：
 
@@ -122,14 +128,14 @@ MCP 输入是扁平结构：
 | `content` | 是 | 当前可见输入 |
 | `idempotencyKey` | 是 | 本轮稳定幂等键 |
 | `kind` | 否 | 默认 `user_message` |
-| `attachments` | 否 | `{uri, mediaType?, contentHash?}[]` |
+| `attachments` | 否 | `{uri,mediaType?,contentHash?}[]` |
 | `metadata` | 否 | JSON object |
-| `scope` | 是 | `ScopeRef` |
+| `scope` | 是 | 含 session ID 的 `ScopeRef` |
 | `agentProfile` | 是 | `AgentProfile` |
 
-返回 `TurnPlan`。该操作会先保存输入 SourceEvent，再进行风险识别；风险识别不会读取领域 Episode。
+返回 `TurnPlan`。服务端先保存输入，再从当前输入特征、Agent profile、Calibration 和结构化 Trigger 识别风险；此步骤不会读取领域 Episode。Trigger 的相似度是辅助信号，结构条件不匹配时不能激活。
 
-### `memory_checkpoint_evidence`
+### 4.2 `memory_checkpoint_evidence`
 
 ```ts
 {
@@ -144,7 +150,7 @@ MCP 输入是扁平结构：
 }
 ```
 
-至少一条 observation。服务端为每条观察生成选中证据 checkpoint 事件，保存 Observation，并返回：
+至少一条 observation。服务端为每条观察创建选中证据的 checkpoint SourceEvent，并返回：
 
 ```ts
 interface CheckpointEvidenceResult {
@@ -158,23 +164,54 @@ interface CheckpointEvidenceResult {
 }
 ```
 
-返回的 observation 不回显 content，只给出稳定 ID、kind 和规范化 checkpoint source。`evidenceRefs` 可直接交给 `memory_get_sources` 或 `memory_complete_turn`。完全相同的 turn+observations 重试会从幂等 trace 返回首次结果。
+结果不回显 observation content。完全相同的 turn + observations 重试会从幂等 trace 返回首次结果。
 
-### `memory_recall`
+### 4.3 `memory_recall`
 
 ```ts
 {
   turnId: string;
-  stage: "policy" | "current_evidence" | "world" | "episode" | "source_expansion";
+  stage:
+    | "policy"
+    | "current_evidence"
+    | "world"
+    | "reexperience"
+    | "episode"
+    | "source_expansion";
   query: string;
   budgetTokens?: number; // MCP 最大 8000
+  cursor?: string;
+  recentTurns?: number;  // 仅 reexperience；20..50
+}
+```
+
+返回 `MemoryBundle`。只允许请求 TurnPlan 中存在的 stage；budget 在 runtime 中规范化为 512–8000，默认 8000。
+
+领域 stage 使用 TurnPlan 冻结的 `retrievalStrategy` 融合 BM25、本地 embedding、实体、时间和 thread 信号，再按来源与 evidence facet coverage 重排。缺失信号会确定性降级，并在 `trace.strategies` 中以 `degraded:*` 标记。
+
+### 4.4 `memory_build_workset`
+
+```ts
+{
+  turnId: string;
+  query: string;
+  budgetTokens?: number; // 最大 8000
+  recentTurns?: number;  // 20..50，默认 32
   cursor?: string;
 }
 ```
 
-返回 `MemoryBundle`。只允许请求该 TurnPlan 中存在的 stage。budget 在 runtime 中规范化到 512–8000；缺省为 8000。
+这是 gated `reexperience` stage 的便利工具，返回同一个 `MemoryBundle` 类型并填充 `reexperiencePack`。工作集在预算内包含：
 
-### `memory_get_sources`
+- 最近 completed turn 的输入/输出原始事件；
+- 选中的完整叙事 Episode 及其原始事件；
+- checkpoint、纠错等关键事件；
+- 带情绪线索的事件；
+- active/disputed WorldClaim 事实约束。
+
+Episode 只会完整选入，不会按 token 截断 event range。所有原文仍是不可信证据。
+
+### 4.5 `memory_get_sources`
 
 ```ts
 {
@@ -183,11 +220,11 @@ interface CheckpointEvidenceResult {
 }
 ```
 
-返回完整脱敏 `SourceEvent[]`。除了严格校验每个 SourceRef，event ID还必须已由当前 turn 的 checkpoint Observation 或已持久化 recall trace 授权；仅知道同 workspace 中其他 event ID 会得到 `SCOPE_DENIED`。recall trace 可授权 bundle 中的直接 source refs、World claim/conflict sources、Episode refs 和 counterexample source。
+返回完整脱敏 `SourceEvent[]`。除了校验完整 SourceRef，event ID 还必须由当前 turn 的 checkpoint、冻结活动 Policy 来源或已落盘 recall trace 授权。仅知道同 workspace 的 event ID 会得到 `SCOPE_DENIED`。
 
-该工具不接收由调用方重写的 hash。依赖记忆内部的 SourceRef 在写入和召回时已经由存储层校验；`complete_turn` 还会先执行相同的 turn 授权检查，再严格校验完整 evidence refs。
+recall trace 可授权 bundle 中的直接 source refs、WorldClaim/conflict、Episode、Policy、counterexample 和 Re-experience pack 来源。该工具不接受调用方重写 hash。
 
-### `memory_submit_correction`
+### 4.6 `memory_submit_correction`
 
 ```ts
 {
@@ -201,22 +238,23 @@ interface CheckpointEvidenceResult {
   scopeLevel?: "user" | "workspace" | "session";
   explicit: boolean;
   idempotencyKey: string;
+  origin?: "user_correction" | "self_reflection";
 }
 ```
 
 可能结果：
 
-- `world_claim_active`：显式事实纠错，且 subject/predicate/value 完整；
-- `world_claim_disputed`：同一事实的最新版晚于当前 turn snapshot，新旧并发版本均保留为 disputed；
+- `world_claim_active`：显式完整事实纠错；
+- `world_claim_disputed`：存在晚于 turn snapshot 的并发事实版本；
 - `policy_active`：显式行为要求；
 - `policy_candidate`：非显式行为推断；
 - `correction_candidate`：其他情况。
 
-省略 fact scope 时，有 workspace 则默认 workspace，否则默认 user；behavior 默认 session。服务端不会把 scope 扩大到调用方请求范围之外。事实纠错用 turn snapshot 检测并发：若被纠正的最新版在 begin 之后才出现，不会静默覆盖，而会保留双方 disputed 版本；后续已观察到冲突的新 turn 可显式解决。
+省略 fact scope 时，有 workspace 则默认 workspace，否则默认 user。显式 behavior 默认 session；非显式 behavior 默认 workspace（没有 workspace 时 user），以支持跨 session 聚类。服务端不会扩大调用方显式请求的 scope。
 
-非显式 behavior 只创建 candidate。管理 CLI 的 `approve` 还会强制检查匹配 FailureCluster 已包含至少 3 个独立纠错并覆盖 2 个 session；通过后该显式 CLI 操作才作为人工确认创建 approved 新版本。是否属于非实体特定规则仍由审阅者判断。
+非显式 behavior 会创建 candidate Policy、FailureCluster 和 learning job。只有至少 3 个独立 `user_correction`、覆盖 2 个 session、且非实体特定的 cluster 才能生成 Trigger candidate 和 Calibration shadow；`self_reflection` 可以留下候选和反例，但不计阈值。学习 Policy 仍须管理 CLI 人工批准。
 
-### `memory_complete_turn`
+### 4.7 `memory_complete_turn`
 
 ```ts
 {
@@ -239,152 +277,130 @@ interface CheckpointEvidenceResult {
 }
 ```
 
-服务端只接受本 turn checkpoint/recall trace 已授权的 evidence refs，随后保存最终回答并严格校验 ref。`verifierResult` 是补充输入而不是最终裁决：其 unsupported claims、conflicts 和 policy violations 会并入 deterministic verifier；coverage 不足或非 pass 状态也会转成问题，外部 `pass` 不能清除内置 floor 发现的问题。最多允许一次 retry；不再 retry 时生成 Episode。
+服务端只接受本 turn 已授权的 evidence refs。外部 `verifierResult` 只能补充问题或收紧结果，不能用 `pass` 清除 deterministic floor。最多 retry 一次；最终完成后，runtime 会按叙事边界合并或创建 Episode，并入队 session segmentation job。
 
-complete 的事件、turn 更新、Episode 和结果 trace 在一个 SQLite transaction 中提交。trace ID由 turn+`idempotencyKey` 稳定生成；相同请求重试原样返回首次结果，不会再次消耗 retry。
+complete 的事件、turn 更新、Episode 和结果 trace 在一个 SQLite transaction 中提交。相同 turn + idempotencyKey 重试原样返回首次结果。
 
 ## 5. HTTP API
 
-HTTP 与 MCP 共享同一 runtime。MCP begin 输入是扁平结构，而 HTTP begin 使用完整 `BeginTurnInput` 包装。
+HTTP 与 MCP 共享同一 runtime。MCP begin 输入是扁平结构，HTTP begin 使用完整 `BeginTurnInput`。
 
 | 方法 | 路径 | 请求 | 响应 |
 |---|---|---|---|
-| `GET` | `/v1/health` | 无 | protocol、SQLite、FTS、revision 健康信息 |
-| `POST` | `/v1/handshake` | 任意/空 JSON | 版本、transport、能力声明 |
+| `GET` | `/v1/health` | 无 | protocol、SQLite、FTS、revision、learning job 健康信息 |
+| `POST` | `/v1/handshake` | 任意/空 JSON | 版本、transport 和 capability |
 | `POST` | `/v1/events` | `RecordEventInput` | `201 SourceEvent` |
 | `POST` | `/v1/turns/begin` | `BeginTurnInput` | `201 TurnPlan` |
 | `POST` | `/v1/turns/:id/checkpoint` | `CheckpointEvidenceInput` | `200 CheckpointEvidenceResult` |
 | `POST` | `/v1/turns/:id/recall` | `RecallInput` | `200 MemoryBundle` |
+| `POST` | `/v1/turns/:id/workset` | `BuildWorksetInput` | `200 MemoryBundle` |
 | `POST` | `/v1/sources/get` | `{turnId,sourceRefs}` | `200 SourceEvent[]` |
 | `POST` | `/v1/turns/:id/corrections` | `CorrectionInput` | `201` correction result |
 | `POST` | `/v1/turns/:id/complete` | `CompleteTurnInput` | `200 CompleteTurnResult` |
+| `POST` | `/v1/sessions/end` | `EndSessionInput` | `200 EndSessionResult` |
 
 带 `:id` 的路径要求 path turn ID 与 body `turnId` 完全相同。
 
-`POST /v1/events` 是 adapter-only ingestion endpoint，没有对应 MCP 工具：
+`/v1/events` 和 `/v1/sessions/end` 是 adapter-only，没有对应 MCP 工具。前者允许可信 hook 标记 `selectedEvidence`；未选中的 `tool_call/tool_result` 正文会在进入权威存储前丢弃，只保留白名单 metadata 和 SHA-256 摘要。Claude Code 可从原生 `SessionEnd` 调用后者；Codex 当前没有该 hook 事件，需由外层 wrapper 在确知会话结束时调用。
+
+SessionEnd：
 
 ```ts
-interface RecordEventInput {
-  input: InputEvent;
-  scope: ScopeRef;
-  agentProfile: AgentProfile;
-  selectedEvidence?: boolean;
+interface EndSessionInput {
+  scope: ScopeRef & { sessionId: string };
+  endedAt?: string;
+  idempotencyKey: string;
+}
+
+interface EndSessionResult {
+  sessionId: string;
+  endedAt: string;
+  expiredPolicyCount: number;
+  closedEpisodeIds: string[];
 }
 ```
+
+它关闭 session 和最后一个叙事 Episode，并让同一 session ID 后续 begin 失败。`expiredPolicyCount` 是该 session 内 Policy 数量；这些 Policy 不会被物理删除或跨 session 加载。
 
 handshake 当前返回：
 
 ```json
 {
-  "protocolVersion": "1.0",
+  "protocolVersion": "1.1",
   "transports": ["http", "mcp-stdio", "cli"],
   "maxRecallTokens": 8000,
   "supports": {
     "stageGates": true,
     "encryptedExport": true,
-    "continuousSync": false
+    "continuousSync": false,
+    "hybridRetrieval": true,
+    "reexperienceWorkset": true,
+    "triggerLearning": true,
+    "sessionLifecycle": true
   }
 }
-```
-
-### HTTP begin 示例
-
-```bash
-curl -sS http://127.0.0.1:7337/v1/turns/begin \
-  -H 'content-type: application/json' \
-  -H "authorization: Bearer $MEMORYD_TOKEN" \
-  -d '{
-    "input": {
-      "idempotencyKey": "session-42-turn-7",
-      "kind": "user_message",
-      "content": "重构前这个函数为什么这样设计？"
-    },
-    "scope": {
-      "userId": "local-default",
-      "workspaceId": "workspace-id",
-      "sessionId": "session-42",
-      "branch": "main",
-      "commit": "abc123"
-    },
-    "agentProfile": {
-      "family": "generic",
-      "version": "1",
-      "capabilities": {"hooks": false, "stageGates": false}
-    }
-  }'
-```
-
-未设置 `MEMORYD_TOKEN` 时应省略 Authorization header。
-
-### Checkpoint 后召回示例
-
-```bash
-curl -sS http://127.0.0.1:7337/v1/turns/TURN_ID/checkpoint \
-  -H 'content-type: application/json' \
-  -d '{
-    "turnId": "TURN_ID",
-    "observations": [{
-      "kind": "current_file",
-      "content": "当前实现中 parseConfig 已改为异步。",
-      "source": {"path": "src/config.ts", "commit": "abc123"}
-    }]
-  }'
-
-# 从上述响应读取 .evidenceRefs；也可通过 current_evidence 再取得这些 refs
-curl -sS http://127.0.0.1:7337/v1/turns/TURN_ID/recall \
-  -H 'content-type: application/json' \
-  -d '{"turnId":"TURN_ID","stage":"current_evidence","query":""}'
-
-curl -sS http://127.0.0.1:7337/v1/turns/TURN_ID/recall \
-  -H 'content-type: application/json' \
-  -d '{"turnId":"TURN_ID","stage":"episode","query":"parseConfig 重构"}'
 ```
 
 ## 6. TurnPlan
 
 | 字段 | 含义 |
 |---|---|
-| `protocolVersion` | 固定 `1.0` |
+| `protocolVersion` | 固定 `1.1` |
 | `turnId` | 当前 turn 稳定 ID |
-| `snapshotRevision` | 生成计划时的权威 revision；后续领域召回的 `maxRevision` 上界 |
-| `agentProfileKey` | calibration 隔离键 |
-| `risks` | 每类风险的最终概率和 rule/classifier/calibration 贡献 |
+| `snapshotRevision` | 计划创建时的权威 revision；领域召回上界 |
+| `agentProfileKey` | Calibration 隔离键 |
+| `risks` | 每类风险的最终概率及 rule/classifier/calibration/trigger contributions |
 | `modes` | evidence、uncertainty、source、clarification、narrative 强度 |
-| `retrievalStages` | 固定的有序 stage 及 gate 标记 |
-| `gate` | 是否必须 checkpoint、当前是否满足及原因 |
-| `activePolicies` | 当前 scope 下每个 policy ID 的最新 approved 版本 |
+| `retrievalStages` | 根据主风险排序的 stage；含 checkpoint gate 标记 |
+| `gate` | evidence checkpoint 是否 required/satisfied 及原因 |
+| `activePolicies` | 当前真正加载的 approved Policy 与被拉入的依赖 |
+| `policySchedule` | 可选扩展；L1/L2/L3/Archive 及 dependency error |
+| `retrievalStrategy` | 可选扩展；风险、步骤、五路权重、coverage 和安全开关 |
 | `enforcementLevel` | `enforced` 或 `advisory` |
-| `retryCount` | verifier retry 次数，当前最多 1 |
+| `retryCount` | verifier retry 次数，最多 1 |
 | `createdAt` | 计划创建时间 |
 
-风险聚合使用最大值而不是平均值。可选 classifier 超时或失败时不会让 begin 失败，rule 结果继续生效。
+风险聚合使用最大值而不是平均值。Policy schedule 是对所有最新 Policy 的可观测调度结果；只有 `shouldLoad` 的项目进入 `activePolicies`。Policy 本体不衰减，Trigger priority 只影响 tier，当前条件命中会直接提升到 L1。
 
 ## 7. MemoryBundle
 
 | 字段 | 含义 |
 |---|---|
-| `snapshotRevision` | TurnPlan 的 revision 上界；领域结果必须满足 `revision <= snapshotRevision` |
+| `snapshotRevision` | TurnPlan revision 上界 |
 | `indexRevision` | 当前派生索引 revision |
 | `stage` | 本次请求 stage |
-| `worldClaims` | query 命中的事实；每条含 `sources` |
-| `episodes` | query 命中的任务片段；每条含 `eventRefs` |
-| `sourceRefs` | `source_expansion` 命中的事件引用，或 `current_evidence` 的 checkpoint 引用；不含原文 |
-| `policies` | policy stage 的全部活动策略；当前公共 recall 不做 Policy FTS query |
-| `counterexamples` | 当前 scope 最近最多 10 条带来源的 behavior correction；各 stage 都可能出现 |
-| `conflicts` | 当前 scope 的 disputed World claim；不只限于 query 命中 |
-| `sourceCoverage` | 本次返回 claim/Episode 中带来源的比例；没有 source-bearing item 时为 1 |
-| `trace` | query、策略名、候选数、返回数和可选下一页 cursor |
+| `worldClaims` | 命中的事实；每条含 `sources` |
+| `episodes` | 命中的完整叙事片段；每条含 `eventRefs`，可含 turn/topic/boundary/salience/emotion |
+| `sourceRefs` | 当前 stage 授权的来源引用 |
+| `policies` | policy stage 冻结的活动 Policy |
+| `counterexamples` | 当前 scope 最近最多 10 条带来源 behavior correction |
+| `conflicts` | 当前 scope/snapshot 的 disputed WorldClaim |
+| `reexperiencePack` | reexperience/workset stage 的近期、历史、关键、情绪原文及事实约束 |
+| `sourceCoverage` | 返回候选的平均独立来源覆盖 |
+| `trace` | query、策略、候选/返回数、cursor、strategy ID、实际信号和 coverage rerank |
 | `untrustedEvidenceNotice` | 固定的不可信历史证据提示 |
 
-各 stage 的主结果：
+`reexperiencePack` 的核心字段：
 
-- `policy`：活动策略；
-- `current_evidence`：不回显 Observation 文本，返回本 turn checkpoint 的 `sourceRefs`；
-- `world`：World claim；
-- `episode`：Episode；
-- `source_expansion`：SourceRef。
-
-无论 stage，bundle 仍可能附带 behavior corrections 和 disputed conflicts。
+```ts
+interface MemoryReexperiencePack {
+  recentSourceRefs: SourceRef[];
+  recentEvents: SourceEvent[];
+  historicalEpisodes: EpisodeMemory[];
+  historicalEvents: SourceEvent[];
+  keyEventRefs: SourceRef[];
+  keyEvents: SourceEvent[];
+  emotionalEventRefs: SourceRef[];
+  emotionalEvents: SourceEvent[];
+  factConstraints: WorldClaim[];
+  window: {
+    requestedTurns: number;
+    includedTurns: number;
+    startedAt?: string;
+    endedAt?: string;
+  };
+}
+```
 
 ## 8. VerifierResult
 
@@ -399,38 +415,54 @@ interface VerifierResult {
 }
 ```
 
-内置 verifier 不会自行从自然语言中全面发现 policy violation、冲突或所有 unsupported claim；这些数组主要由更上层 verifier 补充。它额外检测少量“according to memory / I remember / 我记得”等无 evidence 表达。无论外部 `verifierResult.status` 是什么，最终 status 都由合并问题后的 deterministic verifier 重算；外部结果只能收紧，不能绕过 floor。
+内置 verifier 汇总调用方报告的问题，并额外检测少量“according to memory / I remember / 我记得”等无 evidence 表达。它不会自行全面理解自然语言 Policy、冲突或 unsupported claim。最终 status 由合并问题后的 deterministic verifier 重算，外部结果只能收紧。
 
-## 9. 错误与 HTTP 映射
+## 9. 管理 CLI 与慢速学习
+
+```text
+memoryctl start | stop | doctor | replay | learn --once
+memoryctl inspect [id] [--all]
+memoryctl approve <policy-id> | revoke <policy-id>
+memoryctl calibration retire <pattern-id>
+memoryctl forget <entity-type> <entity-id> --reason <text>
+memoryctl export <file> [--passphrase <text>]
+memoryctl import <file> [--passphrase <text>]
+memoryctl reindex
+memoryctl install <claude|codex|all> [--scope user|project]
+```
+
+- `learn --once` 为当前 scope 的 reviewed/promoted cluster 入队并立即处理学习 job。
+- `inspect --all` 包含当前 user/workspace scope 内的 WorldClaim、Policy、Episode、correction、FailureCluster、Trigger、Calibration 和 learning job；`--all` 展开版本与 session 可见性，但不会绕过 scope ACL。
+- `approve` 强制检查学习阈值和 dependency cycle，并激活关联 Trigger；`revoke` 退休关联 Trigger。
+- `calibration retire` 停止指定 active/shadow pattern。
+- `reindex` 重建 FTS/source link，并重建 narrative Episode、embedding bucket 和 entity index。
+
+daemon 还按 `MEMORYD_LEARNING_INTERVAL_MS`（默认 5000 ms）后台处理持久化 learning job。该管理面不应无条件暴露给模型。
+
+## 10. 错误与 HTTP 映射
 
 | code | HTTP | 典型原因 |
 |---|---:|---|
-| `INVALID_REQUEST` | 400 | schema、path/body、不合法操作 |
+| `INVALID_REQUEST` | 400 | schema、path/body、cursor 或不合法操作 |
 | `TURN_NOT_FOUND` | 404 | turn 不存在 |
 | `NOT_FOUND` | 404 | source 或依赖不存在 |
-| `SCOPE_DENIED` | 403 | user/workspace/session ACL，或 source 未经本 turn checkpoint/recall 授权；Bearer 失败例外为 401 |
-| `STAGE_BLOCKED` | 409 | checkpoint 前请求被 gate 的 stage |
-| `VERSION_CONFLICT` | 409 | 幂等键复用、SourceRef 不匹配、同 ID 不同内容 |
-| `MEMORY_UNAVAILABLE` | 通常 500 | 未映射的服务端错误；客户端也用它包装非协议 HTTP 错误 |
+| `SCOPE_DENIED` | 403 | ACL 或 source 未经本 turn 授权；Bearer 失败为 401 |
+| `STAGE_BLOCKED` | 409 | checkpoint 前请求 gated stage |
+| `VERSION_CONFLICT` | 409 | 幂等键复用、SourceRef 不匹配、session 已结束、同 ID 不同内容 |
+| `MEMORY_UNAVAILABLE` | 通常 500 | 未映射服务端错误；client 也用它包装非协议 HTTP 错误 |
 
 HTTP validation 由 Zod 执行，错误 details 含 issues。MCP 把相同业务错误编码为 tool error，不改变协议 code。
 
-## 10. 一致性、分页与安全要求
+## 11. 一致性、分页和降级
 
-- `snapshotRevision` 是 turn 开始时的权威版本。World、Episode、SourceEvent 搜索以及 correction/conflict 附件使用它作为 `maxRevision` 上界，活动 Policy 使用 begin 时已冻结的列表；因此同一 turn 不会看到之后写入的领域记忆。checkpoint 是当前 turn evidence，可在 snapshot 之后写入并通过 `current_evidence` 返回。该上界不是任意时间点的完整 MVCC query。
-- cursor 只对当前 query/stage 结果顺序有意义。当前搜索最多考虑 100 个 hit，不应把 cursor 当持久书签。
-- 所有历史 source 和 Episode 必须作为 quoted/untrusted evidence；只有 `policies` 是记忆侧行为规则。
-- 当前 evidence、源码和实时工具结果优先于历史内容。调用方应把真正采用的、且已经由本 turn checkpoint 或 recall trace 授权的来源放进 `complete_turn.evidenceRefs`。
-- checkpoint、correction、complete 的多表写入各自在单个 SQLite transaction/savepoint 中完成，并把业务结果保存在确定性 trace 中。相同请求的 trace 命中会直接返回旧结果；部分写入不会在异常后单独留存。
-- MCP 不提供 approve、revoke、forget、export、import、reindex；不要把管理 CLI 无条件暴露成 Agent tool。
-- `/v1/events` 面向可信 adapter。它允许标记 `selectedEvidence`，不应直接开放给不可信远程调用方。未选中的 `tool_call/tool_result` 只保留白名单元数据和内容摘要，原文在进入权威存储前丢弃；选中证据才保存经过脱敏和加密的正文。
+- `snapshotRevision` 冻结 turn 可见上界；current evidence 是允许晚于 snapshot 的本 turn 例外。它不是任意时间点的完整 MVCC query。
+- cursor 是 stable rank tuple 的 keyset token，绑定 snapshot、retrieval strategy 和 query 摘要；跨 query/stage/plan 复用返回 `INVALID_REQUEST`。
+- 历史 source、Episode 和 Re-experience 必须作为 quoted/untrusted evidence；只有 `activePolicies` 是记忆侧行为规则。
+- 当前 evidence、源码和实时工具结果优先于历史内容。真正采用的已授权来源应进入 `complete_turn.evidenceRefs`。
+- checkpoint、correction 和 complete 的多表写入各自在 transaction/savepoint 中提交，并用确定性 trace 幂等。
+- classifier 失败时规则、Calibration 和 Trigger 继续；embedding/实体信号失败时 recall 用剩余信号重新归一化并在 trace 标记降级。
+- daemon/MCP 失败时 hook 允许普通任务继续，但提示不得声称召回成功；payload 进入加密 hook spool，由后续 SessionStart 或 `memoryctl replay` 顺序重放。
+- 不支持 hooks/stage gates 的 Agent 应把 capability 设为 false，并按 advisory TurnPlan 自行编排。
+- v1 没有版本范围协商；通过 handshake 检查精确 `protocolVersion` 和 capability。
 
-## 11. 降级与兼容
-
-- 可选 classifier 失败：规则模式继续。
-- daemon/MCP 失败：hook 提示继续但不得声称召回成功；失败 payload 进入本地加密逐文件队列，后续成功 SessionStart 或 `memoryctl replay` 按顺序重放。
-- 不支持 hooks/stage gates 的 Agent：把 capability 设为 false并按 advisory TurnPlan 自行编排。
-- v1 没有版本协商范围，只能通过 handshake 检查精确 `protocolVersion`。
-- HTTP、MCP 和静态 JSON Schema 共享主要业务类型；adapter-only `/v1/events` 是补充接口，不在模型 MCP 工具面中。
-
-连续同步明确未实现。加密 export/import 是管理工作流，不属于在线协议，也不保证全包原子性或 workspace scope 自动重映射。
+连续同步仍未实现。加密 export/import 是管理工作流，不保证全包原子性或 workspace scope 自动重映射。

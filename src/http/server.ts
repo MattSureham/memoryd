@@ -1,14 +1,16 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import * as z from "zod/v4";
-import { ProtocolError, type ProtocolErrorShape, type RecordEventInput } from "../contracts.js";
+import { PROTOCOL_VERSION, ProtocolError, type ProtocolErrorShape, type RecordEventInput } from "../contracts.js";
 import type { RuntimeConfig } from "../config.js";
 import { MemoryRuntime } from "../runtime.js";
 import {
   AgentProfileSchema,
   BeginTurnSchema,
+  BuildWorksetSchema,
   CheckpointEvidenceSchema,
   CompleteTurnSchema,
   CorrectionSchema,
+  EndSessionSchema,
   InputEventSchema,
   RecallSchema,
   SourceRefSchema,
@@ -115,10 +117,18 @@ export function createMemoryHttpServer(runtime: MemoryRuntime, config: RuntimeCo
       }
       if (method === "POST" && url.pathname === "/v1/handshake") {
         json(response, 200, {
-          protocolVersion: "1.0",
+          protocolVersion: PROTOCOL_VERSION,
           transports: ["http", "mcp-stdio", "cli"],
           maxRecallTokens: 8_000,
-          supports: { stageGates: true, encryptedExport: true, continuousSync: false },
+          supports: {
+            stageGates: true,
+            encryptedExport: true,
+            continuousSync: false,
+            hybridRetrieval: true,
+            reexperienceWorkset: true,
+            triggerLearning: true,
+            sessionLifecycle: true,
+          },
         });
         return;
       }
@@ -137,6 +147,11 @@ export function createMemoryHttpServer(runtime: MemoryRuntime, config: RuntimeCo
         json(response, 200, runtime.getSources(input.turnId, input.sourceRefs as never));
         return;
       }
+      if (method === "POST" && url.pathname === "/v1/sessions/end") {
+        const input = EndSessionSchema.parse(await readJson(request));
+        json(response, 200, runtime.endSession(input as never));
+        return;
+      }
 
       const checkpoint = url.pathname.match(/^\/v1\/turns\/([^/]+)\/checkpoint$/);
       if (method === "POST" && checkpoint?.[1] !== undefined) {
@@ -150,6 +165,13 @@ export function createMemoryHttpServer(runtime: MemoryRuntime, config: RuntimeCo
         const input = RecallSchema.parse(await readJson(request));
         assertTurnPath(decodeURIComponent(recall[1]), input.turnId);
         json(response, 200, runtime.recall(input as never));
+        return;
+      }
+      const workset = url.pathname.match(/^\/v1\/turns\/([^/]+)\/workset$/);
+      if (method === "POST" && workset?.[1] !== undefined) {
+        const input = BuildWorksetSchema.parse(await readJson(request));
+        assertTurnPath(decodeURIComponent(workset[1]), input.turnId);
+        json(response, 200, runtime.buildWorkset(input as never));
         return;
       }
       const correction = url.pathname.match(/^\/v1\/turns\/([^/]+)\/corrections$/);

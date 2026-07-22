@@ -1,5 +1,6 @@
-import { PROTOCOL_VERSION, type AgentProfile, type PolicyRef, type RetrievalStage, type RiskCode, type RiskScore, type TurnPlan } from "../contracts.js";
+import { PROTOCOL_VERSION, type AgentProfile, type PolicyRef, type PolicySchedule, type RetrievalStage, type RetrievalStageName, type RiskCode, type RiskScore, type TurnPlan } from "../contracts.js";
 import { orderPolicies } from "./policy.js";
+import { buildDynamicRetrievalStrategy } from "./retrieval.js";
 
 const GATED_RISKS = new Set<RiskCode>([
   "entity_or_symbol_merge",
@@ -17,14 +18,24 @@ function highest(risks: readonly RiskScore[], codes?: ReadonlySet<RiskCode>): nu
   }, 0);
 }
 
-function stages(gated: boolean): RetrievalStage[] {
-  return [
-    { name: "policy", order: 0, blockedUntilCheckpoint: false },
-    { name: "current_evidence", order: 1, blockedUntilCheckpoint: false },
-    { name: "world", order: 2, blockedUntilCheckpoint: gated },
-    { name: "episode", order: 3, blockedUntilCheckpoint: gated },
-    { name: "source_expansion", order: 4, blockedUntilCheckpoint: gated },
-  ];
+function stages(gated: boolean, risks: readonly RiskScore[]): RetrievalStage[] {
+  const dominant = [...risks]
+    .filter((risk) => risk.probability >= 0.4)
+    .sort((left, right) => right.probability - left.probability || left.code.localeCompare(right.code))[0]?.code;
+  const ordered: RetrievalStageName[] = dominant === "entity_or_symbol_merge"
+    ? ["policy", "current_evidence", "world", "source_expansion", "episode", "reexperience"]
+    : dominant === "narrative_completion"
+      ? ["current_evidence", "policy", "source_expansion", "episode", "reexperience", "world"]
+      : dominant === "stale_source"
+        ? ["current_evidence", "policy", "source_expansion", "world", "episode", "reexperience"]
+        : dominant === "cross_session_merge" || dominant === "unsupported_inference"
+          ? ["policy", "current_evidence", "source_expansion", "episode", "reexperience", "world"]
+          : ["policy", "current_evidence", "world", "episode", "reexperience", "source_expansion"];
+  return ordered.map((name, order) => ({
+    name,
+    order,
+    blockedUntilCheckpoint: gated && !["policy", "current_evidence"].includes(name),
+  }));
 }
 
 export interface BuildTurnPlanInput {
@@ -33,6 +44,7 @@ export interface BuildTurnPlanInput {
   profile: AgentProfile;
   risks: RiskScore[];
   policies: PolicyRef[];
+  policySchedule?: PolicySchedule;
   retryCount?: number;
   createdAt?: string;
 }
@@ -61,7 +73,7 @@ export function buildTurnPlan(input: BuildTurnPlanInput): TurnPlan {
       askClarification: destructive >= 0.7 ? "high" : totalHigh ? "medium" : "low",
       narrativeCompletionGate: narrative >= 0.7 ? "blocked" : narrative >= 0.4 ? "high" : "off",
     },
-    retrievalStages: stages(gateRequired),
+    retrievalStages: stages(gateRequired, input.risks),
     gate: {
       kind: "evidence_checkpoint",
       required: gateRequired,
@@ -69,6 +81,8 @@ export function buildTurnPlan(input: BuildTurnPlanInput): TurnPlan {
       ...(gateRequired ? { reason: "Current primary evidence must be locked before historical domain memory is exposed." } : {}),
     },
     activePolicies: orderPolicies(input.policies),
+    ...(input.policySchedule === undefined ? {} : { policySchedule: input.policySchedule }),
+    retrievalStrategy: buildDynamicRetrievalStrategy(input.risks),
     enforcementLevel:
       input.profile.capabilities.hooks && input.profile.capabilities.stageGates ? "enforced" : "advisory",
     retryCount: input.retryCount ?? 0,

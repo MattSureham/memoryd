@@ -104,6 +104,11 @@ export interface TriggerRecord {
   priority: number;
   activationCount: number;
   lastActivatedAt?: string;
+  status?: "candidate" | "active" | "retired";
+  learnedFromClusterId?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  sourceRefs?: SourceRef[];
 }
 
 export interface FailureClusterRecord {
@@ -122,6 +127,81 @@ export interface CalibrationPatternRecord {
   riskCode: string;
   pattern: unknown;
   metrics?: Record<string, number>;
+  sourceRefs?: SourceRef[];
+}
+
+export interface StoredEmbedding {
+  ownerType: SearchKind;
+  ownerId: string;
+  provider: string;
+  model: string;
+  vector: number[];
+  revision: number;
+  occurredAt?: string;
+  sessionId?: string;
+}
+
+export interface EntityOwnerHit {
+  kind: SearchKind;
+  id: string;
+  distance: number;
+}
+
+export interface OwnerMetadata {
+  kind: SearchKind;
+  id: string;
+  revision: number;
+  occurredAt?: string;
+  sessionId?: string;
+}
+
+export interface SourceEventListOptions {
+  includeAllSessions?: boolean;
+  maxRevision?: number;
+  limit?: number;
+  kinds?: SourceEvent["kind"][];
+}
+
+export interface SessionLifecycleRecord {
+  scope: ScopeRef & { sessionId: string };
+  status: "active" | "ended";
+  startedAt: string;
+  endedAt?: string;
+  endIdempotencyKey?: string;
+  revision: number;
+}
+
+export type LearningJobType =
+  | "analyze_cluster"
+  | "evaluate_calibration"
+  | "index_embedding"
+  | "rebuild_entity_graph"
+  | "segment_session";
+
+export interface LearningJobRecord {
+  jobId: string;
+  revision: number;
+  idempotencyKey: string;
+  scope: ScopeRef;
+  type: LearningJobType;
+  status: "pending" | "running" | "completed" | "failed";
+  attempts: number;
+  availableAt: string;
+  leasedAt?: string;
+  lastError?: string;
+  payload: Record<string, unknown>;
+}
+
+export interface TriggerActivationRecord {
+  activationId: string;
+  revision: number;
+  triggerId: string;
+  turnId: string;
+  scope: ScopeRef;
+  structuralScore: number;
+  similarityScore: number;
+  effectiveScore: number;
+  activatedAt: string;
 }
 
 export type SearchKind = "source_event" | "world_claim" | "policy" | "episode";
@@ -194,4 +274,9 @@ export interface StoreHealth {
   integrityCheck: string;
   eventCount: number;
   issues: string[];
+  pendingLearningJobs?: number;
+  failedLearningJobs?: number;
+  endedSessions?: number;
+  embeddingCount?: number;
+  entityEdgeCount?: number;
 }

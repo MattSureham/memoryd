@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = "1.0" as const;
+export const PROTOCOL_VERSION = "1.1" as const;
 
 export type ProtocolVersion = typeof PROTOCOL_VERSION;
 
@@ -92,7 +92,7 @@ export type RiskCode =
   | "secret_exposure";
 
 export interface RiskContribution {
-  source: "rule" | "classifier" | "calibration";
+  source: "rule" | "classifier" | "calibration" | "trigger";
   score: number;
   reason: string;
 }
@@ -117,6 +117,7 @@ export type RetrievalStageName =
   | "policy"
   | "current_evidence"
   | "world"
+  | "reexperience"
   | "episode"
   | "source_expansion";
 
@@ -145,6 +146,65 @@ export interface PolicyRef {
   sources?: SourceRef[];
 }
 
+export type PolicyScheduleTier = "L1" | "L2" | "L3" | "Archive";
+
+export interface PolicyScheduleEntry {
+  policyId: string;
+  version: number;
+  tier: PolicyScheduleTier;
+  reason: string;
+  triggerIds?: string[];
+  dependencies?: string[];
+}
+
+export interface PolicySchedule {
+  l1: PolicyScheduleEntry[];
+  l2: PolicyScheduleEntry[];
+  l3: PolicyScheduleEntry[];
+  archive: PolicyScheduleEntry[];
+  dependencyErrors: Array<{
+    policyId: string;
+    kind: "missing" | "cycle" | "inactive";
+    dependencyId?: string;
+  }>;
+}
+
+export type PlanRetrievalSignal =
+  | "bm25"
+  | "embedding"
+  | "entity"
+  | "temporal"
+  | "thread";
+
+export type PlanRetrievalStep =
+  | "scope_filter"
+  | "redaction_filter"
+  | "policy"
+  | "current_evidence"
+  | "checkpoint"
+  | "exact_match"
+  | "bm25"
+  | "embedding"
+  | "timeline"
+  | "entity_graph"
+  | "thread"
+  | "complete_episode"
+  | "original_source"
+  | "conflict_check";
+
+export interface PlanRetrievalStrategy {
+  strategyId: string;
+  riskCodes: RiskCode[];
+  orderedSteps: PlanRetrievalStep[];
+  weights: Record<PlanRetrievalSignal, number>;
+  sourceCoverageWeight: number;
+  minimumEvidenceCoverage: number;
+  checkpointFirst: boolean;
+  originalSourceRequired: boolean;
+  sameWorkspaceOnly: boolean;
+  allowEmbedding: boolean;
+}
+
 export interface TurnPlan {
   protocolVersion: ProtocolVersion;
   turnId: string;
@@ -155,6 +215,10 @@ export interface TurnPlan {
   retrievalStages: RetrievalStage[];
   gate: StageGate;
   activePolicies: PolicyRef[];
+  /** Additive v1 extension. Older persisted plans may not contain it. */
+  policySchedule?: PolicySchedule;
+  /** Risk-specific retrieval and reranking plan used by memory_recall. */
+  retrievalStrategy?: PlanRetrievalStrategy;
   enforcementLevel: "enforced" | "advisory";
   retryCount: number;
   createdAt: string;
@@ -195,6 +259,12 @@ export interface EpisodeMemory {
   tags: string[];
   startedAt: string;
   endedAt: string;
+  /** Narrative chunks may span several completed turns. */
+  turnIds?: string[];
+  topicKey?: string;
+  boundaryReason?: "new_session" | "topic_shift" | "correction" | "time_gap" | "size_limit" | "explicit";
+  salience?: number;
+  emotionTags?: string[];
 }
 
 export interface Counterexample {
@@ -203,6 +273,29 @@ export interface Counterexample {
   correction: string;
   lesson?: string;
   source: SourceRef;
+}
+
+export interface MemoryReexperiencePack {
+  /** Recent visible events, normally covering the latest 20-50 turns. */
+  recentSourceRefs: SourceRef[];
+  recentEvents: SourceEvent[];
+  /** Complete narrative chunks selected from older history. */
+  historicalEpisodes: EpisodeMemory[];
+  historicalEvents: SourceEvent[];
+  keyEventRefs: SourceRef[];
+  keyEvents: SourceEvent[];
+  emotionalEventRefs: SourceRef[];
+  emotionalEvents: SourceEvent[];
+  /** Reviewed correction evidence selected by the same workset budget. */
+  correctionSourceRefs: SourceRef[];
+  corrections: Counterexample[];
+  factConstraints: WorldClaim[];
+  window: {
+    requestedTurns: number;
+    includedTurns: number;
+    startedAt?: string;
+    endedAt?: string;
+  };
 }
 
 export interface MemoryBundle {
@@ -218,6 +311,7 @@ export interface MemoryBundle {
   policies: PolicyRef[];
   counterexamples: Counterexample[];
   conflicts: WorldClaim[];
+  reexperiencePack?: MemoryReexperiencePack;
   sourceCoverage: number;
   trace: {
     query: string;
@@ -225,6 +319,9 @@ export interface MemoryBundle {
     candidateCount: number;
     returnedCount: number;
     nextCursor?: string;
+    strategyId?: string;
+    rankingSignals?: PlanRetrievalSignal[];
+    coverageReranked?: boolean;
   };
   untrustedEvidenceNotice: string;
 }
@@ -240,14 +337,14 @@ export interface VerifierResult {
 
 export interface BeginTurnInput {
   input: InputEvent;
-  scope: ScopeRef;
+  scope: ScopeRef & { sessionId: string };
   agentProfile: AgentProfile;
 }
 
 /** Adapter-only ingestion endpoint; this is intentionally not exposed as an MCP tool. */
 export interface RecordEventInput {
   input: InputEvent;
-  scope: ScopeRef;
+  scope: ScopeRef & { sessionId: string };
   agentProfile: AgentProfile;
   selectedEvidence?: boolean;
 }
@@ -273,6 +370,16 @@ export interface RecallInput {
   query: string;
   budgetTokens?: number;
   cursor?: string;
+  /** Used by the reexperience stage; clamped to 20-50. */
+  recentTurns?: number;
+}
+
+export interface BuildWorksetInput {
+  turnId: string;
+  query: string;
+  budgetTokens?: number;
+  recentTurns?: number;
+  cursor?: string;
 }
 
 export type CorrectionKind = "fact" | "behavior" | "unknown";
@@ -288,6 +395,21 @@ export interface CorrectionInput {
   scopeLevel?: ScopeLevel;
   explicit: boolean;
   idempotencyKey: string;
+  /** Self-reflection may create a candidate but never satisfies automatic learning thresholds. */
+  origin?: "user_correction" | "self_reflection";
+}
+
+export interface EndSessionInput {
+  scope: ScopeRef & { sessionId: string };
+  endedAt?: string;
+  idempotencyKey: string;
+}
+
+export interface EndSessionResult {
+  sessionId: string;
+  endedAt: string;
+  expiredPolicyCount: number;
+  closedEpisodeIds: string[];
 }
 
 export interface CompleteTurnInput {

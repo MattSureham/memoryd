@@ -3,7 +3,7 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { replayHookSpool, runHook } from "../src/adapters/hook.js";
+import { formatHookOutput, replayHookSpool, runHook } from "../src/adapters/hook.js";
 import type { RuntimeConfig } from "../src/config.js";
 import { createMemoryHttpServer } from "../src/http/server.js";
 import { MemoryRuntime } from "../src/runtime.js";
@@ -18,6 +18,21 @@ afterEach(() => {
 });
 
 describe("hook degradation queue", () => {
+  it("encodes Stop retry feedback for Claude and Codex while preserving generic output", () => {
+    const retry = "[memoryd verifier] Retry once with stricter evidence.";
+    expect(JSON.parse(formatHookOutput("claude", "stop", retry))).toEqual({
+      decision: "block",
+      reason: retry,
+    });
+    expect(JSON.parse(formatHookOutput("codex", "stop", retry))).toEqual({
+      decision: "block",
+      reason: retry,
+    });
+    expect(formatHookOutput("generic", "stop", retry)).toBe(retry);
+    expect(formatHookOutput("codex", "stop", "")).toBe("");
+    expect(formatHookOutput("codex", "user-prompt", retry)).toBe(retry);
+  });
+
   it("encrypts failed hook payloads and replays them idempotently when memoryd returns", async () => {
     const home = mkdtempSync(join(tmpdir(), "memoryd-hook-"));
     directories.push(home);
@@ -43,6 +58,7 @@ describe("hook degradation queue", () => {
       host: "127.0.0.1",
       port: 0,
       deviceId: "hook",
+      learningIntervalMs: 5_000,
     };
     const server = createMemoryHttpServer(new MemoryRuntime(store), config);
     server.listen(0, "127.0.0.1");
@@ -55,6 +71,15 @@ describe("hook degradation queue", () => {
       expect(await replayHookSpool()).toEqual({ replayed: 1, remaining: 0 });
       expect(store.health().eventCount).toBe(1);
       expect(await replayHookSpool()).toEqual({ replayed: 0, remaining: 0 });
+      expect(await runHook("generic", "session-end", {
+        sessionId: "queued-session",
+        cwd: home,
+        endedAt: "2026-07-22T12:00:00.000Z",
+      })).toBe("");
+      expect(store.getSession("queued-session")).toMatchObject({
+        status: "ended",
+        endedAt: "2026-07-22T12:00:00.000Z",
+      });
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       store.close();
