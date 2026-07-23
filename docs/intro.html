@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>memoryd · 跨 Agent 的本地长期记忆运行时</title>
+<title>memoryd · 本地长期记忆运行时 / Local-First Memory Runtime</title>
 <style>
   :root {
     --bg: #0f1419;
@@ -14,7 +14,6 @@
     --accent: #5ec4b6;
     --accent-2: #7aa2f7;
     --warn: #e0af68;
-    --danger: #f7768e;
     --line: #2d3a4f;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -25,6 +24,18 @@
     line-height: 1.75;
   }
   .wrap { max-width: 960px; margin: 0 auto; padding: 0 24px; }
+  .lang { display: none; }
+  .lang.active { display: block; }
+  #lang-toggle {
+    position: fixed; top: 18px; right: 18px; z-index: 10;
+    display: flex; border: 1px solid var(--line); border-radius: 999px;
+    overflow: hidden; background: var(--panel); font-size: 13px;
+  }
+  #lang-toggle button {
+    border: none; background: transparent; color: var(--ink-dim);
+    padding: 7px 16px; cursor: pointer; font-size: 13px; font-family: inherit;
+  }
+  #lang-toggle button.on { background: var(--accent); color: #0f1419; font-weight: 600; }
   header {
     padding: 96px 0 64px;
     text-align: center;
@@ -37,20 +48,15 @@
   h1 { font-size: 52px; letter-spacing: -1px; }
   h1 .accent { color: var(--accent); }
   .tagline { font-size: 20px; color: var(--ink-dim); margin-top: 16px; }
-  .lang-switch { margin-top: 24px; font-size: 14px; }
-  .lang-switch a { color: var(--accent-2); text-decoration: none; border-bottom: 1px dashed var(--accent-2); }
   section { padding: 56px 0; border-top: 1px solid var(--line); }
   h2 { font-size: 30px; margin-bottom: 8px; }
   h2 .num { color: var(--accent); font-size: 18px; vertical-align: super; margin-right: 6px; }
   .sub { color: var(--ink-dim); margin-bottom: 28px; }
   p { margin-bottom: 14px; }
   .card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin: 24px 0; }
-  .card {
-    background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px;
-  }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
   .card h3 { font-size: 16px; margin-bottom: 8px; color: var(--accent); }
   .card p, .card li { font-size: 14px; color: var(--ink-dim); }
-  .card ul { padding-left: 18px; }
   .figure {
     background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
     padding: 28px 20px; margin: 24px 0; overflow-x: auto;
@@ -93,12 +99,19 @@
 </head>
 <body>
 
+<div id="lang-toggle" role="group" aria-label="Language">
+  <button id="btn-zh" type="button">中文</button>
+  <button id="btn-en" type="button">EN</button>
+</div>
+
+<!-- ============================ 中文 ============================ -->
+<div class="lang" id="lang-zh">
+
 <header>
   <div class="wrap">
     <div class="badge">v0.1.0 · 协议 1.1 · 本地优先 · 开源 MVP</div>
     <h1>memory<span class="accent">d</span></h1>
     <p class="tagline">跨 Agent 的本地长期记忆运行时<br>让 AI 不只"记住更多"，而是"越来越了解自己的认知边界"</p>
-    <div class="lang-switch"><a href="intro-en.html">English Version →</a></div>
   </div>
 </header>
 
@@ -128,49 +141,39 @@
             <path d="M0,0 L8,4 L0,8 Z" fill="#5ec4b6"/>
           </marker>
         </defs>
-        <!-- Row 1 -->
         <g font-size="13" text-anchor="middle">
           <rect x="10" y="30" width="120" height="48" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
           <text x="70" y="58" fill="#e8edf4">用户输入</text>
           <line x1="130" y1="54" x2="152" y2="54" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow)"/>
-
           <rect x="156" y="30" width="140" height="48" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
           <text x="226" y="50" fill="#e8edf4">特征提取</text>
           <text x="226" y="66" fill="#9aa8bc" font-size="11">压缩特征·隐私投影</text>
           <line x1="296" y1="54" x2="318" y2="54" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow)"/>
-
           <rect x="322" y="30" width="150" height="48" rx="10" fill="#212b3b" stroke="#5ec4b6"/>
           <text x="397" y="50" fill="#5ec4b6">风险识别器</text>
           <text x="397" y="66" fill="#9aa8bc" font-size="11">规则路由 + 轻量分类器</text>
           <line x1="472" y1="54" x2="494" y2="54" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow)"/>
-
           <rect x="498" y="30" width="150" height="48" rx="10" fill="#212b3b" stroke="#5ec4b6"/>
           <text x="573" y="50" fill="#5ec4b6">认知模式控制</text>
           <text x="573" y="66" fill="#9aa8bc" font-size="11">强度调节·检索顺序</text>
           <line x1="648" y1="54" x2="670" y2="54" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow)"/>
-
           <rect x="674" y="30" width="150" height="48" rx="10" fill="#212b3b" stroke="#7aa2f7"/>
           <text x="749" y="50" fill="#7aa2f7">门控记忆检索</text>
           <text x="749" y="66" fill="#9aa8bc" font-size="11">证据先行·混合召回</text>
         </g>
-        <!-- Connector down -->
         <path d="M749 78 L749 110 L397 110 L397 128" fill="none" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow)"/>
-        <!-- Row 2 -->
         <g font-size="13" text-anchor="middle">
           <rect x="322" y="130" width="150" height="48" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
           <text x="397" y="150" fill="#e8edf4">主推理</text>
           <text x="397" y="166" fill="#9aa8bc" font-size="11">在活跃约束下回答</text>
           <line x1="472" y1="154" x2="494" y2="154" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow)"/>
-
           <rect x="498" y="130" width="150" height="48" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
           <text x="573" y="150" fill="#e8edf4">验证器</text>
           <text x="573" y="166" fill="#9aa8bc" font-size="11">证据覆盖·违规检查</text>
           <line x1="648" y1="154" x2="670" y2="154" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow)"/>
-
           <rect x="674" y="130" width="150" height="48" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
           <text x="749" y="158" fill="#e8edf4">回答</text>
         </g>
-        <!-- Correction loop -->
         <path d="M749 178 L749 240 L170 240 L170 196" fill="none" stroke="#e0af68" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
         <g font-size="13" text-anchor="middle">
           <rect x="90" y="130" width="160" height="64" rx="10" fill="#212b3b" stroke="#e0af68"/>
@@ -199,11 +202,9 @@
           <rect x="60" y="16" width="800" height="68" rx="12" fill="#212b3b" stroke="#7aa2f7"/>
           <text x="90" y="44" fill="#7aa2f7" font-weight="600">World Memory · 世界模型</text>
           <text x="90" y="66" fill="#9aa8bc" font-size="12.5">回答"世界是什么样子的" —— Ruby 是猫 · 精确匹配 + 实体关系遍历</text>
-
           <rect x="60" y="98" width="800" height="68" rx="12" fill="#212b3b" stroke="#5ec4b6"/>
           <text x="90" y="126" fill="#5ec4b6" font-weight="600">Episode Memory · 原始经历</text>
           <text x="90" y="148" fill="#9aa8bc" font-size="12.5">回答"我们一起经历了什么" —— 按叙事边界切块，存原文不存摘要，摘要只是索引</text>
-
           <rect x="60" y="180" width="800" height="68" rx="12" fill="#212b3b" stroke="#e0af68"/>
           <text x="90" y="208" fill="#e0af68" font-weight="600">Policy Memory · 推理策略</text>
           <text x="90" y="230" fill="#9aa8bc" font-size="12.5">回答"我应该怎么思考" —— 不编造引用 · 不剧透 · 只描述图中可见；有作用域和生命周期</text>
@@ -248,27 +249,20 @@
           <text x="380" y="47" fill="#e8edf4">Codex</text>
           <rect x="520" y="20" width="200" height="44" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
           <text x="620" y="47" fill="#e8edf4">任意 Agent</text>
-
           <line x1="140" y1="64" x2="300" y2="106" stroke="#7aa2f7" stroke-width="1.5" marker-end="url(#arrow2)"/>
           <line x1="380" y1="64" x2="380" y2="100" stroke="#7aa2f7" stroke-width="1.5" marker-end="url(#arrow2)"/>
           <line x1="620" y1="64" x2="470" y2="106" stroke="#7aa2f7" stroke-width="1.5" marker-end="url(#arrow2)"/>
-
           <rect x="240" y="104" width="280" height="44" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
           <text x="380" y="122" fill="#9aa8bc" font-size="11.5">Hooks + Skills + MCP(stdio)</text>
           <text x="380" y="139" fill="#e8edf4">memoryctl hook / memory-mcp</text>
-
           <line x1="380" y1="148" x2="380" y2="176" stroke="#7aa2f7" stroke-width="1.5" marker-end="url(#arrow2)"/>
           <text x="440" y="168" fill="#9aa8bc" font-size="11.5">HTTP · 127.0.0.1:7337</text>
-
           <rect x="140" y="180" width="480" height="52" rx="10" fill="#212b3b" stroke="#5ec4b6"/>
           <text x="380" y="201" fill="#5ec4b6" font-weight="600">memoryd daemon</text>
           <text x="380" y="220" fill="#9aa8bc" font-size="11.5">风险+Trigger → TurnPlan → 证据门 → 混合召回 → 验证器 → 慢速学习 worker</text>
-
           <line x1="380" y1="232" x2="380" y2="258" stroke="#7aa2f7" stroke-width="1.5" marker-end="url(#arrow2)"/>
-
           <rect x="140" y="262" width="480" height="34" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
           <text x="380" y="284" fill="#9aa8bc" font-size="11.5">SQLite WAL + FTS5/BM25 + 本地向量 + AES-256-GCM 加密</text>
-
           <rect x="680" y="180" width="200" height="116" rx="10" fill="#212b3b" stroke="#e0af68"/>
           <text x="780" y="205" fill="#e0af68">Obsidian vault</text>
           <text x="780" y="226" fill="#9aa8bc" font-size="11">人类可读的抄本</text>
@@ -345,6 +339,269 @@ memoryctl export-obsidian /path/to/vault   # 记忆 → 笔记</code></pre>
     危险识别 → 模式切换 → 门控混合检索 → 原文工作集 → 验证 → 纠错 → shadow/replay 学习
   </div>
 </footer>
+
+</div>
+
+<!-- ============================ English ============================ -->
+<div class="lang" id="lang-en">
+
+<header>
+  <div class="wrap">
+    <div class="badge">v0.1.0 · Protocol 1.1 · Local-first · Open-source MVP</div>
+    <h1>memory<span class="accent">d</span></h1>
+    <p class="tagline">A local-first long-term memory runtime for AI agents<br>Not just "remember more" — know your own cognitive boundaries</p>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2><span class="num">01</span>The Problem</h2>
+    <p class="sub">A long context window is not reliable memory. Stuff the whole novel in, and the model still reactivates the wrong detail at the wrong moment.</p>
+    <div class="card-grid">
+      <div class="card"><h3>Found, but wrong</h3><p>Similar-but-incorrect passages win retrieval; recent content drowns out earlier context.</p></div>
+      <div class="card"><h3>Entity merging</h3><p>Multiple people and sessions get merged into one — Ruby the cat becomes a person; Andrew becomes Michael.</p></div>
+      <div class="card"><h3>Narrative completion</h3><p>The model infers off-screen events from story momentum instead of reading the evidence in front of it.</p></div>
+      <div class="card"><h3>Facts without context</h3><p>The fact is retrieved correctly, but the emotion, causality and narrative position are lost.</p></div>
+    </div>
+    <div class="quote">"Don't compress memory into facts; index memory into the original experience. The knowledge graph finds the door — the raw conversation episode is the room behind it."</div>
+    <p>So memoryd's goal is not classic RAG "top-k paragraphs from a pile of notes". It is: <strong>first predict which error is most likely here, then deliberately rebuild the original local context</strong>. This is a shift from adding capacity to improving metacognition.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="num">02</span>The Core Pipeline</h2>
+    <p class="sub">Every turn runs the full loop: anticipate risk, gate retrieval, answer, then learn.</p>
+    <div class="figure">
+      <svg viewBox="0 0 920 300" width="100%" role="img" aria-label="memoryd pipeline diagram">
+        <defs>
+          <marker id="arrow-en" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="#5ec4b6"/>
+          </marker>
+        </defs>
+        <g font-size="13" text-anchor="middle">
+          <rect x="10" y="30" width="120" height="48" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
+          <text x="70" y="58" fill="#e8edf4">User input</text>
+          <line x1="130" y1="54" x2="152" y2="54" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow-en)"/>
+          <rect x="156" y="30" width="140" height="48" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
+          <text x="226" y="50" fill="#e8edf4">Feature extractor</text>
+          <text x="226" y="66" fill="#9aa8bc" font-size="11">compressed, privacy-safe</text>
+          <line x1="296" y1="54" x2="318" y2="54" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow-en)"/>
+          <rect x="322" y="30" width="150" height="48" rx="10" fill="#212b3b" stroke="#5ec4b6"/>
+          <text x="397" y="50" fill="#5ec4b6">Risk recognizer</text>
+          <text x="397" y="66" fill="#9aa8bc" font-size="11">rules + light classifier</text>
+          <line x1="472" y1="54" x2="494" y2="54" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow-en)"/>
+          <rect x="498" y="30" width="150" height="48" rx="10" fill="#212b3b" stroke="#5ec4b6"/>
+          <text x="573" y="50" fill="#5ec4b6">Mode controller</text>
+          <text x="573" y="66" fill="#9aa8bc" font-size="11">intensity, not on/off</text>
+          <line x1="648" y1="54" x2="670" y2="54" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow-en)"/>
+          <rect x="674" y="30" width="150" height="48" rx="10" fill="#212b3b" stroke="#7aa2f7"/>
+          <text x="749" y="50" fill="#7aa2f7">Gated retrieval</text>
+          <text x="749" y="66" fill="#9aa8bc" font-size="11">evidence first, hybrid</text>
+        </g>
+        <path d="M749 78 L749 110 L397 110 L397 128" fill="none" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow-en)"/>
+        <g font-size="13" text-anchor="middle">
+          <rect x="322" y="130" width="150" height="48" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
+          <text x="397" y="150" fill="#e8edf4">Main reasoning</text>
+          <text x="397" y="166" fill="#9aa8bc" font-size="11">under active constraints</text>
+          <line x1="472" y1="154" x2="494" y2="154" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow-en)"/>
+          <rect x="498" y="130" width="150" height="48" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
+          <text x="573" y="150" fill="#e8edf4">Verifier</text>
+          <text x="573" y="166" fill="#9aa8bc" font-size="11">coverage · violations</text>
+          <line x1="648" y1="154" x2="670" y2="154" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow-en)"/>
+          <rect x="674" y="130" width="150" height="48" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
+          <text x="749" y="158" fill="#e8edf4">Answer</text>
+        </g>
+        <path d="M749 178 L749 240 L170 240 L170 196" fill="none" stroke="#e0af68" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrow-en)"/>
+        <g font-size="13" text-anchor="middle">
+          <rect x="90" y="130" width="160" height="64" rx="10" fill="#212b3b" stroke="#e0af68"/>
+          <text x="170" y="152" fill="#e0af68">Correction analyzer</text>
+          <text x="170" y="168" fill="#9aa8bc" font-size="11">attribute → cluster → threshold</text>
+          <text x="170" y="184" fill="#9aa8bc" font-size="11">human approval required</text>
+          <line x1="170" y1="130" x2="170" y2="102" stroke="#e0af68" stroke-width="1.5" stroke-dasharray="5,4"/>
+          <line x1="170" y1="102" x2="392" y2="102" stroke="#e0af68" stroke-width="1.5" stroke-dasharray="5,4"/>
+          <line x1="392" y1="102" x2="392" y2="82" stroke="#e0af68" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrow-en)"/>
+          <text x="282" y="96" fill="#e0af68" font-size="11">update calibration profile / triggers</text>
+        </g>
+      </svg>
+      <figcaption>Fig. 1 · The online fast path (teal) and the slow learning loop (dashed orange)</figcaption>
+    </div>
+    <p>The single most important decision: <strong>memory retrieval runs after mode control, not before</strong>. When the system senses narrative-completion risk, it requires observing the image independently and locking visible facts before plot memory is allowed in. Experts don't just switch modes earlier — they know which information must stay temporarily isolated.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="num">03</span>Three Layers of Memory</h2>
+    <p class="sub">Three kinds of memory answer three different questions. Constraints are memory too.</p>
+    <div class="figure">
+      <svg viewBox="0 0 920 260" width="100%" role="img" aria-label="three-layer memory diagram">
+        <g font-size="14">
+          <rect x="60" y="16" width="800" height="68" rx="12" fill="#212b3b" stroke="#7aa2f7"/>
+          <text x="90" y="44" fill="#7aa2f7" font-weight="600">World Memory</text>
+          <text x="90" y="66" fill="#9aa8bc" font-size="12.5">"What is the world like?" — Ruby is a cat · exact match + entity graph traversal</text>
+          <rect x="60" y="98" width="800" height="68" rx="12" fill="#212b3b" stroke="#5ec4b6"/>
+          <text x="90" y="126" fill="#5ec4b6" font-weight="600">Episode Memory</text>
+          <text x="90" y="148" fill="#9aa8bc" font-size="12.5">"What did we go through?" — chunked by narrative boundaries; originals, not summaries</text>
+          <rect x="60" y="180" width="800" height="68" rx="12" fill="#212b3b" stroke="#e0af68"/>
+          <text x="90" y="208" fill="#e0af68" font-weight="600">Policy Memory</text>
+          <text x="90" y="230" fill="#9aa8bc" font-size="12.5">"How should I think?" — never fabricate citations · no spoilers · scoped, with lifecycles</text>
+        </g>
+      </svg>
+      <figcaption>Fig. 2 · Facts, experiences, and constraints on how to think</figcaption>
+    </div>
+    <p>Policies are scheduled like a CPU cache (L1/L2/L3/Archive): recently triggered rules sit in the shallowest retrieval tier, long-dormant ones sink to the background. But <strong>what decays is the trigger's activation frequency, never the policy itself</strong> — the rule stays valid forever; only its scheduling priority fades, and it snaps back to the foreground the moment its condition reappears.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="num">04</span>A Safe Learning Loop</h2>
+    <p class="sub">One correction is not one rule. Behavior changes only after clustering, replay — and human approval.</p>
+    <table>
+      <tr><th></th><th>Fact correction</th><th>Behavior correction</th></tr>
+      <tr><td>Example</td><td>"Ruby is a cat"</td><td>"Don't complete the scene from the plot"</td></tr>
+      <tr><td>Written to</td><td>World Memory (immediate)</td><td>FailureCluster → trigger candidate / calibration shadow</td></tr>
+      <tr><td>Takes effect</td><td>Immediately</td><td>≥3 independent corrections across 2 sessions, non-entity-specific, <strong>then human approve</strong></td></tr>
+      <tr><td>Blast radius</td><td>One entity</td><td>All future similar tasks</td></tr>
+    </table>
+    <p>Learned calibration patterns start in <strong>shadow mode</strong>: they observe live traffic without acting on it, accumulating samples and latency metrics, while a background worker replays history to measure coverage and false-activation rates. Only patterns passing every metric turn active. The system gets better at knowing where it errs — without fossilizing one-off mistakes into narrow rules. That would be memorizing answers, not calibration.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="num">05</span>Deployment Shape</h2>
+    <p class="sub">One local sidecar serving Claude Code, Codex, and any agent.</p>
+    <div class="figure">
+      <svg viewBox="0 0 920 300" width="100%" role="img" aria-label="deployment diagram">
+        <defs>
+          <marker id="arrow2-en" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="#7aa2f7"/>
+          </marker>
+        </defs>
+        <g font-size="13" text-anchor="middle">
+          <rect x="40" y="20" width="200" height="44" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
+          <text x="140" y="47" fill="#e8edf4">Claude Code</text>
+          <rect x="280" y="20" width="200" height="44" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
+          <text x="380" y="47" fill="#e8edf4">Codex</text>
+          <rect x="520" y="20" width="200" height="44" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
+          <text x="620" y="47" fill="#e8edf4">Any agent</text>
+          <line x1="140" y1="64" x2="300" y2="106" stroke="#7aa2f7" stroke-width="1.5" marker-end="url(#arrow2-en)"/>
+          <line x1="380" y1="64" x2="380" y2="100" stroke="#7aa2f7" stroke-width="1.5" marker-end="url(#arrow2-en)"/>
+          <line x1="620" y1="64" x2="470" y2="106" stroke="#7aa2f7" stroke-width="1.5" marker-end="url(#arrow2-en)"/>
+          <rect x="240" y="104" width="280" height="44" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
+          <text x="380" y="122" fill="#9aa8bc" font-size="11.5">Hooks + Skills + MCP (stdio)</text>
+          <text x="380" y="139" fill="#e8edf4">memoryctl hook / memory-mcp</text>
+          <line x1="380" y1="148" x2="380" y2="176" stroke="#7aa2f7" stroke-width="1.5" marker-end="url(#arrow2-en)"/>
+          <text x="440" y="168" fill="#9aa8bc" font-size="11.5">HTTP · 127.0.0.1:7337</text>
+          <rect x="140" y="180" width="480" height="52" rx="10" fill="#212b3b" stroke="#5ec4b6"/>
+          <text x="380" y="201" fill="#5ec4b6" font-weight="600">memoryd daemon</text>
+          <text x="380" y="220" fill="#9aa8bc" font-size="11.5">risk+triggers → TurnPlan → evidence gate → hybrid recall → verifier → learning worker</text>
+          <line x1="380" y1="232" x2="380" y2="258" stroke="#7aa2f7" stroke-width="1.5" marker-end="url(#arrow2-en)"/>
+          <rect x="140" y="262" width="480" height="34" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
+          <text x="380" y="284" fill="#9aa8bc" font-size="11.5">SQLite WAL + FTS5/BM25 + local vectors + AES-256-GCM</text>
+          <rect x="680" y="180" width="200" height="116" rx="10" fill="#212b3b" stroke="#e0af68"/>
+          <text x="780" y="205" fill="#e0af68">Obsidian vault</text>
+          <text x="780" y="226" fill="#9aa8bc" font-size="11">human-readable mirror</text>
+          <text x="780" y="245" fill="#9aa8bc" font-size="11">import: notes → memory</text>
+          <text x="780" y="262" fill="#9aa8bc" font-size="11">export: memory → notes</text>
+          <text x="780" y="282" fill="#9aa8bc" font-size="10.5">(body hash prevents loops)</text>
+          <line x1="620" y1="238" x2="676" y2="238" stroke="#e0af68" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrow2-en)"/>
+        </g>
+      </svg>
+      <figcaption>Fig. 3 · A single local process; Obsidian is the human's door in</figcaption>
+    </div>
+    <p>Host integration is one command — <code>memoryctl install all --scope project</code> — which writes hooks, MCP config, skills and AGENTS.md guidance. If the daemon is unreachable, hooks degrade gracefully: the agent keeps working, failed events land in an encrypted spool, and they replay later. Memory is never silently dropped.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="num">06</span>Tech Stack</h2>
+    <p class="sub">Deliberately boring choices: zero cloud services, zero heavy dependencies, everything auditable.</p>
+    <div class="stack-grid">
+      <div class="stack-item"><div class="name">TypeScript + Node.js 22</div><div class="role">All source and the daemon; ESM, strict type checking</div></div>
+      <div class="stack-item"><div class="name">better-sqlite3</div><div class="role">Authoritative store: WAL mode, transactions/savepoints, FTS5 full-text (BM25)</div></div>
+      <div class="stack-item"><div class="name">MCP SDK</div><div class="role">@modelcontextprotocol/sdk exposes a stdio MCP server to hosts</div></div>
+      <div class="stack-item"><div class="name">zod</div><div class="role">Protocol boundary validation; JSON Schema shipped in the repo</div></div>
+      <div class="stack-item"><div class="name">node:crypto</div><div class="role">AES-256-GCM at-rest encryption + known-credential redaction</div></div>
+      <div class="stack-item"><div class="name">Custom building blocks</div><div class="role">Local hash-ngram embeddings + bucket index, entity graph, narrative chunking, hybrid rerank</div></div>
+      <div class="stack-item"><div class="name">Vitest + tsx</div><div class="role">17 test files, 115 tests; built-in 100k-event benchmark</div></div>
+      <div class="stack-item"><div class="name">pnpm</div><div class="role">Package management and global linking (memoryctl / memory-mcp)</div></div>
+    </div>
+    <p style="margin-top:20px">Semantic search needs no external model service: the default embedding is a <strong>local deterministic feature hash</strong>. When an index is missing, retrieval degrades explicitly — re-weighting the remaining signals and recording it in the trace — instead of pretending semantic search happened.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="num">07</span>Measured Performance</h2>
+    <p class="sub">Local benchmark over 100,000 events (rule mode, embeddings off).</p>
+    <div class="metrics">
+      <div class="metric"><div class="value">5.12<span style="font-size:16px">ms</span></div><div class="label">risk preflight p95 (target 150ms)</div></div>
+      <div class="metric"><div class="value">229<span style="font-size:16px">ms</span></div><div class="label">hybrid recall p95 (target 500ms)</div></div>
+      <div class="metric"><div class="value">100k</div><div class="label">benchmark events</div></div>
+      <div class="metric"><div class="value">115</div><div class="label">automated tests passing</div></div>
+    </div>
+    <p>These p95 numbers are <strong>release gates</strong>, not luck. The benchmark caught a missing entity-edge index causing O(n²) writes, and a recall query materializing the whole workspace (647ms p95) — both fixed before release with regression tests added.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="num">08</span>Getting Started</h2>
+    <pre><code># Build and link (requires Node.js 22+ and pnpm 10)
+pnpm install && pnpm build && pnpm link --global
+
+# Start the local daemon and self-check
+memoryctl start
+memoryctl doctor
+
+# Install agent adapters in a target project (Claude Code / Codex)
+cd your-project
+memoryctl install all --scope project
+
+# Optional: connect an Obsidian vault
+memoryctl import-obsidian /path/to/vault   # notes → memory
+memoryctl export-obsidian /path/to/vault   # memory → notes</code></pre>
+    <div class="warn-box">
+      <strong>Security boundaries:</strong> the daemon listens on loopback only — no TLS, no multi-user isolation; notes exported to Obsidian are plaintext and enter the vault's own sync scope; losing <code>~/.memoryd/master.key</code> makes encrypted payloads unrecoverable.
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    memoryd · a local-first long-term memory runtime · design docs in the repo (Chinese): 记忆架构.md, 记忆架构讨论原文.md<br>
+    risk recognition → mode switching → gated hybrid recall → original workset → verification → correction → shadow/replay learning
+  </div>
+</footer>
+
+</div>
+
+<script>
+(function () {
+  var zh = document.getElementById("lang-zh");
+  var en = document.getElementById("lang-en");
+  var btnZh = document.getElementById("btn-zh");
+  var btnEn = document.getElementById("btn-en");
+  function show(lang) {
+    zh.classList.toggle("active", lang === "zh");
+    en.classList.toggle("active", lang === "en");
+    btnZh.classList.toggle("on", lang === "zh");
+    btnEn.classList.toggle("on", lang === "en");
+    document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+    try { localStorage.setItem("memoryd-intro-lang", lang); } catch (e) {}
+  }
+  btnZh.addEventListener("click", function () { show("zh"); });
+  btnEn.addEventListener("click", function () { show("en"); });
+  var saved = null;
+  try { saved = localStorage.getItem("memoryd-intro-lang"); } catch (e) {}
+  var preferred = (navigator.language || "").toLowerCase().indexOf("zh") === 0 ? "zh" : "en";
+  show(saved === "zh" || saved === "en" ? saved : preferred);
+})();
+</script>
 
 </body>
 </html>
