@@ -1,8 +1,37 @@
 # memoryd：跨 Agent 的本地长期记忆运行时
 
+**中文** | [English](README.en.md)
+
 `memoryd` 是一个面向 Claude Code、Codex 和其他 Agent 的本地优先长期记忆 MVP。它把原始可见事件、事实、任务片段和行为策略放进同一个 SQLite 权威存储，并在检索历史内容前执行风险识别与证据门控。
 
 当前版本为 `0.1.0`，协议版本为 `1.1`。项目尚未发布到 npm，需从源码构建和链接。
+
+## 架构一览
+
+每轮对话的在线链路与慢速学习回路：
+
+```mermaid
+flowchart TD
+    A["用户输入"] --> B["特征提取"]
+    B --> C["Risk Recognizer<br/>规则路由 + 轻量分类器"]
+    C --> D["Cognitive Mode Controller<br/>模式 + 强度 + 检索顺序"]
+    D --> E["门控混合检索<br/>FTS5/BM25 + 向量 + 实体 + 时间"]
+    E --> F["主推理（活跃约束下）"]
+    F --> G["Verifier 自检"]
+    G --> H["回答"]
+    H -. "纠错" .-> I["归因 → 聚类 → 阈值"]
+    I -. "人工批准" .-> J["Calibration / Trigger 更新"]
+    J -. "喂养" .-> C
+```
+
+三层记忆模型，约束本身也是记忆：
+
+```mermaid
+flowchart TB
+    W["World Memory · 世界模型<br/>回答“世界什么样”——精确匹配 + 实体关系遍历"]
+    E["Episode Memory · 原始经历<br/>回答“一起经历了什么”——存原文不存摘要，摘要只是索引"]
+    P["Policy Memory · 推理策略<br/>回答“应该怎么思考”——有作用域和生命周期；Policy 不衰减，只衰减 Trigger 激活频率"]
+```
 
 ## 已实现能力
 
@@ -58,22 +87,13 @@
 
 ## 运行结构
 
-```text
-Claude Code / Codex / Generic Agent
-        │ hooks + Skills + MCP
-        │             └──────────────┐
-        ▼                            ▼
-  memoryctl hook               memory-mcp (stdio)
-        │                            │
-        └──────── HTTP ──────────────┘
-                     ▼
-             memoryd 127.0.0.1:7337
- Risk + Trigger → TurnPlan → Gate → Hybrid Recall → Verifier
-             │                 └─ Re-experience
-             └─ learning worker → shadow/replay
-                     │
-                     ▼
-       SQLite WAL + FTS5 + local vectors + encrypted payloads
+```mermaid
+flowchart TD
+    CC["Claude Code"] & CX["Codex"] & AG["其他 Agent"] --> HK["Hooks + Skills + MCP(stdio)<br/>memoryctl hook / memory-mcp"]
+    HK -->|"HTTP · 127.0.0.1:7337"| D["memoryd daemon<br/>Risk + Trigger → TurnPlan → Gate → Hybrid Recall → Verifier"]
+    D --> LW["learning worker<br/>shadow / replay"]
+    D --> DB[("SQLite WAL + FTS5 + 本地向量<br/>AES-256-GCM 加密")]
+    D <-.->|"import / export（可选）"| OB["Obsidian vault<br/>人类可读抄本"]
 ```
 
 MCP server 是 HTTP daemon 的代理，因此使用 MCP 前必须先启动 `memoryd`。
