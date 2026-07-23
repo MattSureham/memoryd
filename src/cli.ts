@@ -14,6 +14,7 @@ import {
   type HookVendor,
 } from "./adapters/hook.js";
 import { installAdapters, type InstallScope, type InstallTarget } from "./install.js";
+import { exportObsidianVault, importObsidianVault } from "./adapters/obsidian.js";
 import { resolvePolicyDependencies } from "./core/index.js";
 import { MemoryRuntime } from "./runtime.js";
 import { MemoryStore, type ForgetSelector, type StoredPolicy } from "./storage/index.js";
@@ -40,6 +41,8 @@ function usage(): never {
   forget <entity-type> <entity-id> --reason <text>
   export <file> [--passphrase <text>]
   import <file> [--passphrase <text>]
+  import-obsidian <vault-path>
+  export-obsidian <vault-path>
   reindex
   install <claude|codex|all> [--scope user|project]
   hook <claude|codex|generic> <event>
@@ -247,6 +250,27 @@ function importData(path: string, passphrase?: string): void {
   }
 }
 
+function importObsidian(vaultPath: string): void {
+  const store = openStore();
+  try {
+    const scope = currentScope();
+    const summary = importObsidianVault(store, { vaultPath, scope });
+    const derived = new MemoryRuntime(store).rebuildDerivedIndexes(scope);
+    output({ ...summary, derivedIndexes: derived });
+  } finally {
+    store.close();
+  }
+}
+
+function exportObsidian(vaultPath: string): void {
+  const store = openStore();
+  try {
+    output(exportObsidianVault(store, { vaultPath, scope: currentScope() }));
+  } finally {
+    store.close();
+  }
+}
+
 async function main(args = process.argv.slice(2)): Promise<void> {
   const command = args[0];
   if (command === "start") return await start();
@@ -267,6 +291,8 @@ async function main(args = process.argv.slice(2)): Promise<void> {
   }
   if (command === "export" && args[1] !== undefined) return exportData(args[1], option(args, "--passphrase"));
   if (command === "import" && args[1] !== undefined) return importData(args[1], option(args, "--passphrase"));
+  if (command === "import-obsidian" && args[1] !== undefined) return importObsidian(args[1]);
+  if (command === "export-obsidian" && args[1] !== undefined) return exportObsidian(args[1]);
   if (command === "reindex") {
     const store = openStore();
     try {
