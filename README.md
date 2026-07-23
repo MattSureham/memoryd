@@ -31,6 +31,7 @@ flowchart TB
     W["World Memory · 世界模型<br/>回答“世界什么样”——精确匹配 + 实体关系遍历"]
     E["Episode Memory · 原始经历<br/>回答“一起经历了什么”——存原文不存摘要，摘要只是索引"]
     P["Policy Memory · 推理策略<br/>回答“应该怎么思考”——有作用域和生命周期；Policy 不衰减，只衰减 Trigger 激活频率"]
+    W --- E --- P
 ```
 
 ## 已实现能力
@@ -89,7 +90,7 @@ flowchart TB
 
 ```mermaid
 flowchart TD
-    CC["Claude Code"] & CX["Codex"] & AG["其他 Agent"] --> HK["Hooks + Skills + MCP(stdio)<br/>memoryctl hook / memory-mcp"]
+    CC["Claude Code"] & CX["Codex"] & AG["其他 Agent"] --> HK["Hooks + Skills + MCP (stdio)"]
     HK -->|"HTTP · 127.0.0.1:7337"| D["memoryd daemon<br/>Risk + Trigger → TurnPlan → Gate → Hybrid Recall → Verifier"]
     D --> LW["learning worker<br/>shadow / replay"]
     D --> DB[("SQLite WAL + FTS5 + 本地向量<br/>AES-256-GCM 加密")]

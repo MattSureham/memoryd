@@ -31,6 +31,7 @@ flowchart TB
     W["World Memory<br/>'What is the world like?' — exact match + entity graph traversal"]
     E["Episode Memory<br/>'What did we go through?' — originals, not summaries; summaries are only indexes"]
     P["Policy Memory<br/>'How should I think?' — scoped, with lifecycles; policies never decay, only trigger activation frequency does"]
+    W --- E --- P
 ```
 
 ## Implemented capabilities
@@ -89,7 +90,7 @@ The following audits `0.1.0` against [记忆架构.md](记忆架构.md) and [记
 
 ```mermaid
 flowchart TD
-    CC["Claude Code"] & CX["Codex"] & AG["Other agents"] --> HK["Hooks + Skills + MCP (stdio)<br/>memoryctl hook / memory-mcp"]
+    CC["Claude Code"] & CX["Codex"] & AG["Other agents"] --> HK["Hooks + Skills + MCP (stdio)"]
     HK -->|"HTTP · 127.0.0.1:7337"| D["memoryd daemon<br/>Risk + Trigger → TurnPlan → Gate → Hybrid Recall → Verifier"]
     D --> LW["learning worker<br/>shadow / replay"]
     D --> DB[("SQLite WAL + FTS5 + local vectors<br/>AES-256-GCM encryption")]
