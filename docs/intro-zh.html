@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>memoryd · 跨 Agent 的本地长期记忆运行时</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #1a2230;
+    --panel-2: #212b3b;
+    --ink: #e8edf4;
+    --ink-dim: #9aa8bc;
+    --accent: #5ec4b6;
+    --accent-2: #7aa2f7;
+    --warn: #e0af68;
+    --danger: #f7768e;
+    --line: #2d3a4f;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", sans-serif;
+    line-height: 1.75;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 0 24px; }
+  header {
+    padding: 96px 0 64px;
+    text-align: center;
+    background: radial-gradient(ellipse 70% 50% at 50% 0%, rgba(94,196,182,.12), transparent);
+  }
+  .badge {
+    display: inline-block; padding: 4px 14px; border: 1px solid var(--line);
+    border-radius: 999px; font-size: 13px; color: var(--ink-dim); margin-bottom: 20px;
+  }
+  h1 { font-size: 52px; letter-spacing: -1px; }
+  h1 .accent { color: var(--accent); }
+  .tagline { font-size: 20px; color: var(--ink-dim); margin-top: 16px; }
+  .lang-switch { margin-top: 24px; font-size: 14px; }
+  .lang-switch a { color: var(--accent-2); text-decoration: none; border-bottom: 1px dashed var(--accent-2); }
+  section { padding: 56px 0; border-top: 1px solid var(--line); }
+  h2 { font-size: 30px; margin-bottom: 8px; }
+  h2 .num { color: var(--accent); font-size: 18px; vertical-align: super; margin-right: 6px; }
+  .sub { color: var(--ink-dim); margin-bottom: 28px; }
+  p { margin-bottom: 14px; }
+  .card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin: 24px 0; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px;
+  }
+  .card h3 { font-size: 16px; margin-bottom: 8px; color: var(--accent); }
+  .card p, .card li { font-size: 14px; color: var(--ink-dim); }
+  .card ul { padding-left: 18px; }
+  .figure {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 28px 20px; margin: 24px 0; overflow-x: auto;
+  }
+  .figure figcaption { text-align: center; color: var(--ink-dim); font-size: 13px; margin-top: 14px; }
+  svg text { font-family: inherit; }
+  code {
+    background: var(--panel-2); border-radius: 6px; padding: 2px 7px;
+    font-family: "SF Mono", Menlo, Consolas, monospace; font-size: .88em; color: var(--accent);
+  }
+  pre {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 20px; overflow-x: auto; margin: 16px 0;
+  }
+  pre code { background: none; padding: 0; color: var(--ink); font-size: 13.5px; line-height: 1.7; }
+  .stack-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; }
+  .stack-item { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  .stack-item .name { font-weight: 600; font-size: 15px; }
+  .stack-item .role { color: var(--ink-dim); font-size: 13px; margin-top: 4px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin: 24px 0; }
+  .metric { text-align: center; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 22px 12px; }
+  .metric .value { font-size: 30px; font-weight: 700; color: var(--accent); }
+  .metric .label { font-size: 13px; color: var(--ink-dim); margin-top: 6px; }
+  .quote {
+    border-left: 3px solid var(--accent); padding: 6px 0 6px 20px; margin: 24px 0;
+    color: var(--ink); font-size: 17px; font-style: italic;
+  }
+  .warn-box {
+    background: rgba(224,175,104,.08); border: 1px solid rgba(224,175,104,.35);
+    border-radius: 12px; padding: 16px 20px; margin: 20px 0; font-size: 14px;
+  }
+  .warn-box strong { color: var(--warn); }
+  footer { padding: 48px 0 64px; text-align: center; color: var(--ink-dim); font-size: 13px; border-top: 1px solid var(--line); }
+  table { width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 14.5px; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+  th { color: var(--accent); font-weight: 600; }
+  td { color: var(--ink-dim); }
+  td:first-child { color: var(--ink); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="badge">v0.1.0 · 协议 1.1 · 本地优先 · 开源 MVP</div>
+    <h1>memory<span class="accent">d</span></h1>
+    <p class="tagline">跨 Agent 的本地长期记忆运行时<br>让 AI 不只"记住更多"，而是"越来越了解自己的认知边界"</p>
+    <div class="lang-switch"><a href="intro-en.html">English Version →</a></div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2><span class="num">01</span>要解决的问题</h2>
+    <p class="sub">长上下文不等于可靠的记忆。把整本"小说"塞进上下文，模型仍然会在关键时刻用错细节。</p>
+    <div class="card-grid">
+      <div class="card"><h3>找到了，但找错了</h3><p>检索到相似但错误的片段；最近的内容压过早期内容。</p></div>
+      <div class="card"><h3>实体合并</h3><p>多个人物、多个会话被错误地合并成一个——Ruby 被当成人，Andrew 被叫成 Michael。</p></div>
+      <div class="card"><h3>叙事补全</h3><p>模型根据"故事惯性"脑补画面外的事件，而不是读取眼前证据。</p></div>
+      <div class="card"><h3>记住了事实，丢了语境</h3><p>事实检索正确，但情绪、因果和叙事位置全部丢失。</p></div>
+    </div>
+    <div class="quote">"不要把记忆压缩成事实；要把记忆索引到原始经历。知识图谱负责找到门，原始对话片段才是门后的房间。"</div>
+    <p>因此 memoryd 的目标不是传统 RAG 的"从一堆笔记里找 top-k 段落"，而是：<strong>先识别这次最容易犯哪种错，再有节制地重建原始局部上下文</strong>。这是从"增加容量"到"提升元认知（metacognition）"的转变。</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="num">02</span>核心流水线</h2>
+    <p class="sub">每一轮对话都经过完整的"先担心、再检索、后回答、再学习"链路。</p>
+    <div class="figure">
+      <svg viewBox="0 0 920 300" width="100%" role="img" aria-label="memoryd 流水线图">
+        <defs>
+          <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="#5ec4b6"/>
+          </marker>
+        </defs>
+        <!-- Row 1 -->
+        <g font-size="13" text-anchor="middle">
+          <rect x="10" y="30" width="120" height="48" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
+          <text x="70" y="58" fill="#e8edf4">用户输入</text>
+          <line x1="130" y1="54" x2="152" y2="54" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+          <rect x="156" y="30" width="140" height="48" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
+          <text x="226" y="50" fill="#e8edf4">特征提取</text>
+          <text x="226" y="66" fill="#9aa8bc" font-size="11">压缩特征·隐私投影</text>
+          <line x1="296" y1="54" x2="318" y2="54" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+          <rect x="322" y="30" width="150" height="48" rx="10" fill="#212b3b" stroke="#5ec4b6"/>
+          <text x="397" y="50" fill="#5ec4b6">风险识别器</text>
+          <text x="397" y="66" fill="#9aa8bc" font-size="11">规则路由 + 轻量分类器</text>
+          <line x1="472" y1="54" x2="494" y2="54" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+          <rect x="498" y="30" width="150" height="48" rx="10" fill="#212b3b" stroke="#5ec4b6"/>
+          <text x="573" y="50" fill="#5ec4b6">认知模式控制</text>
+          <text x="573" y="66" fill="#9aa8bc" font-size="11">强度调节·检索顺序</text>
+          <line x1="648" y1="54" x2="670" y2="54" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+          <rect x="674" y="30" width="150" height="48" rx="10" fill="#212b3b" stroke="#7aa2f7"/>
+          <text x="749" y="50" fill="#7aa2f7">门控记忆检索</text>
+          <text x="749" y="66" fill="#9aa8bc" font-size="11">证据先行·混合召回</text>
+        </g>
+        <!-- Connector down -->
+        <path d="M749 78 L749 110 L397 110 L397 128" fill="none" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow)"/>
+        <!-- Row 2 -->
+        <g font-size="13" text-anchor="middle">
+          <rect x="322" y="130" width="150" height="48" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
+          <text x="397" y="150" fill="#e8edf4">主推理</text>
+          <text x="397" y="166" fill="#9aa8bc" font-size="11">在活跃约束下回答</text>
+          <line x1="472" y1="154" x2="494" y2="154" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+          <rect x="498" y="130" width="150" height="48" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
+          <text x="573" y="150" fill="#e8edf4">验证器</text>
+          <text x="573" y="166" fill="#9aa8bc" font-size="11">证据覆盖·违规检查</text>
+          <line x1="648" y1="154" x2="670" y2="154" stroke="#5ec4b6" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+          <rect x="674" y="130" width="150" height="48" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
+          <text x="749" y="158" fill="#e8edf4">回答</text>
+        </g>
+        <!-- Correction loop -->
+        <path d="M749 178 L749 240 L170 240 L170 196" fill="none" stroke="#e0af68" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
+        <g font-size="13" text-anchor="middle">
+          <rect x="90" y="130" width="160" height="64" rx="10" fill="#212b3b" stroke="#e0af68"/>
+          <text x="170" y="152" fill="#e0af68">纠错分析器</text>
+          <text x="170" y="168" fill="#9aa8bc" font-size="11">归因 → 聚类 → 阈值</text>
+          <text x="170" y="184" fill="#9aa8bc" font-size="11">人工批准才生效</text>
+          <line x1="170" y1="130" x2="170" y2="102" stroke="#e0af68" stroke-width="1.5" stroke-dasharray="5,4"/>
+          <line x1="170" y1="102" x2="392" y2="102" stroke="#e0af68" stroke-width="1.5" stroke-dasharray="5,4"/>
+          <line x1="392" y1="102" x2="392" y2="82" stroke="#e0af68" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
+          <text x="282" y="96" fill="#e0af68" font-size="11">更新自校准画像 / Trigger</text>
+        </g>
+      </svg>
+      <figcaption>图 1 · 在线主链路（青绿）与慢速学习回路（橙色虚线）</figcaption>
+    </div>
+    <p>其中最关键的一个决策：<strong>记忆检索被放在模式控制之后，而不是之前</strong>。当系统判断"这里有叙事补全风险"时，会要求先独立观察画面、固化可见事实，然后才允许加载剧情记忆——专家不仅更早进入正确的思考模式，也知道哪些信息应该暂时隔离。</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="num">03</span>三层记忆</h2>
+    <p class="sub">三种记忆回答三个不同的问题，约束本身也是记忆。</p>
+    <div class="figure">
+      <svg viewBox="0 0 920 260" width="100%" role="img" aria-label="三层记忆图">
+        <g font-size="14">
+          <rect x="60" y="16" width="800" height="68" rx="12" fill="#212b3b" stroke="#7aa2f7"/>
+          <text x="90" y="44" fill="#7aa2f7" font-weight="600">World Memory · 世界模型</text>
+          <text x="90" y="66" fill="#9aa8bc" font-size="12.5">回答"世界是什么样子的" —— Ruby 是猫 · 精确匹配 + 实体关系遍历</text>
+
+          <rect x="60" y="98" width="800" height="68" rx="12" fill="#212b3b" stroke="#5ec4b6"/>
+          <text x="90" y="126" fill="#5ec4b6" font-weight="600">Episode Memory · 原始经历</text>
+          <text x="90" y="148" fill="#9aa8bc" font-size="12.5">回答"我们一起经历了什么" —— 按叙事边界切块，存原文不存摘要，摘要只是索引</text>
+
+          <rect x="60" y="180" width="800" height="68" rx="12" fill="#212b3b" stroke="#e0af68"/>
+          <text x="90" y="208" fill="#e0af68" font-weight="600">Policy Memory · 推理策略</text>
+          <text x="90" y="230" fill="#9aa8bc" font-size="12.5">回答"我应该怎么思考" —— 不编造引用 · 不剧透 · 只描述图中可见；有作用域和生命周期</text>
+        </g>
+      </svg>
+      <figcaption>图 2 · 三层记忆：事实、经历、与"怎么思考"的约束</figcaption>
+    </div>
+    <p>Policy 像 CPU 缓存一样分层调度（L1/L2/L3/Archive）：最近频繁触发的规矩放最浅的检索层，长期未触发的降级到后台。但<strong>衰减的不是 Policy 本体，而是 Trigger 的激活频率</strong>——规矩永远有效，只是调度优先级随时间降低；条件再次出现时瞬间回到前台。</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="num">04</span>安全的学习闭环</h2>
+    <p class="sub">一次纠错不等于一条规则。系统只在聚类验证后、由人批准才改变行为。</p>
+    <table>
+      <tr><th></th><th>事实纠错</th><th>行为纠错</th></tr>
+      <tr><td>例子</td><td>"Ruby 是猫"</td><td>"不要用剧情补全画面"</td></tr>
+      <tr><td>写入</td><td>World Memory（直接生效）</td><td>FailureCluster → Trigger 候选 / Calibration 影子模式</td></tr>
+      <tr><td>生效条件</td><td>立即</td><td>≥3 次独立纠错、跨 2 个会话、非实体特定，<strong>再由人 approve</strong></td></tr>
+      <tr><td>影响范围</td><td>单个实体</td><td>所有未来的类似任务</td></tr>
+    </table>
+    <p>学习到的校准模式先进入 <strong>shadow（影子）模式</strong>：在真实流量上只观察、不干预，累计样本与延迟指标，同时后台 worker 在历史对话上回放（replay）评估覆盖率和误激活率。全部指标达标才转为 active。这保证系统"越用越懂自己哪容易错"，又不会把偶然的口误固化成狭窄的规则——那是记答案，不是校准。</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="num">05</span>运行结构</h2>
+    <p class="sub">一个本地 sidecar，对接 Claude Code、Codex 与任意 Agent。</p>
+    <div class="figure">
+      <svg viewBox="0 0 920 300" width="100%" role="img" aria-label="运行结构图">
+        <defs>
+          <marker id="arrow2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="#7aa2f7"/>
+          </marker>
+        </defs>
+        <g font-size="13" text-anchor="middle">
+          <rect x="40" y="20" width="200" height="44" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
+          <text x="140" y="47" fill="#e8edf4">Claude Code</text>
+          <rect x="280" y="20" width="200" height="44" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
+          <text x="380" y="47" fill="#e8edf4">Codex</text>
+          <rect x="520" y="20" width="200" height="44" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
+          <text x="620" y="47" fill="#e8edf4">任意 Agent</text>
+
+          <line x1="140" y1="64" x2="300" y2="106" stroke="#7aa2f7" stroke-width="1.5" marker-end="url(#arrow2)"/>
+          <line x1="380" y1="64" x2="380" y2="100" stroke="#7aa2f7" stroke-width="1.5" marker-end="url(#arrow2)"/>
+          <line x1="620" y1="64" x2="470" y2="106" stroke="#7aa2f7" stroke-width="1.5" marker-end="url(#arrow2)"/>
+
+          <rect x="240" y="104" width="280" height="44" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
+          <text x="380" y="122" fill="#9aa8bc" font-size="11.5">Hooks + Skills + MCP(stdio)</text>
+          <text x="380" y="139" fill="#e8edf4">memoryctl hook / memory-mcp</text>
+
+          <line x1="380" y1="148" x2="380" y2="176" stroke="#7aa2f7" stroke-width="1.5" marker-end="url(#arrow2)"/>
+          <text x="440" y="168" fill="#9aa8bc" font-size="11.5">HTTP · 127.0.0.1:7337</text>
+
+          <rect x="140" y="180" width="480" height="52" rx="10" fill="#212b3b" stroke="#5ec4b6"/>
+          <text x="380" y="201" fill="#5ec4b6" font-weight="600">memoryd daemon</text>
+          <text x="380" y="220" fill="#9aa8bc" font-size="11.5">风险+Trigger → TurnPlan → 证据门 → 混合召回 → 验证器 → 慢速学习 worker</text>
+
+          <line x1="380" y1="232" x2="380" y2="258" stroke="#7aa2f7" stroke-width="1.5" marker-end="url(#arrow2)"/>
+
+          <rect x="140" y="262" width="480" height="34" rx="10" fill="#212b3b" stroke="#2d3a4f"/>
+          <text x="380" y="284" fill="#9aa8bc" font-size="11.5">SQLite WAL + FTS5/BM25 + 本地向量 + AES-256-GCM 加密</text>
+
+          <rect x="680" y="180" width="200" height="116" rx="10" fill="#212b3b" stroke="#e0af68"/>
+          <text x="780" y="205" fill="#e0af68">Obsidian vault</text>
+          <text x="780" y="226" fill="#9aa8bc" font-size="11">人类可读的抄本</text>
+          <text x="780" y="245" fill="#9aa8bc" font-size="11">import: 笔记 → 记忆</text>
+          <text x="780" y="262" fill="#9aa8bc" font-size="11">export: 记忆 → 笔记</text>
+          <text x="780" y="282" fill="#9aa8bc" font-size="10.5">（防伪哈希防自激循环）</text>
+          <line x1="620" y1="238" x2="676" y2="238" stroke="#e0af68" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrow2)"/>
+        </g>
+      </svg>
+      <figcaption>图 3 · 部署形态：单进程本地服务，Obsidian 作为人的入口</figcaption>
+    </div>
+    <p>宿主持久化配置由 <code>memoryctl install all --scope project</code> 一条命令完成：写入 hooks、MCP 配置、Skills 和 AGENTS.md 指引。daemon 挂掉时 hooks 自动降级——允许 Agent 继续工作，失败事件进入加密队列稍后补写，绝不静默丢记忆。</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="num">06</span>技术栈与框架</h2>
+    <p class="sub">刻意朴素的选型：零云服务、零重型依赖，一切可审计。</p>
+    <div class="stack-grid">
+      <div class="stack-item"><div class="name">TypeScript + Node.js 22</div><div class="role">全部源码与守护进程；ESM、严格类型检查</div></div>
+      <div class="stack-item"><div class="name">better-sqlite3</div><div class="role">权威存储：WAL 模式、事务/保存点、FTS5 全文索引（BM25 排序）</div></div>
+      <div class="stack-item"><div class="name">MCP SDK</div><div class="role">@modelcontextprotocol/sdk，向宿主暴露 stdio MCP server</div></div>
+      <div class="stack-item"><div class="name">zod</div><div class="role">协议边界校验；JSON Schema 随仓库发布</div></div>
+      <div class="stack-item"><div class="name">node:crypto</div><div class="role">AES-256-GCM 静态加密 + 已知凭据模式脱敏</div></div>
+      <div class="stack-item"><div class="name">自研小组件</div><div class="role">本地 hash-ngram embedding + 桶索引、实体关系、叙事切块、混合重排</div></div>
+      <div class="stack-item"><div class="name">Vitest + tsx</div><div class="role">17 个测试文件、115 项测试；内置 10 万事件基准脚本</div></div>
+      <div class="stack-item"><div class="name">pnpm</div><div class="role">包管理与全局链接安装（memoryctl / memory-mcp）</div></div>
+    </div>
+    <p style="margin-top:20px">语义检索不依赖任何外部模型服务：默认 embedding 是<strong>本地确定性特征哈希</strong>，索引缺失时检索会显式降级、重新分配权重并写入 trace，而不是伪装成"已执行语义检索"。</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="num">07</span>实测性能</h2>
+    <p class="sub">10 万条事件的本地基准（规则模式，关闭 embedding）。</p>
+    <div class="metrics">
+      <div class="metric"><div class="value">5.12<span style="font-size:16px">ms</span></div><div class="label">风险识别 p95（目标 150ms）</div></div>
+      <div class="metric"><div class="value">229<span style="font-size:16px">ms</span></div><div class="label">混合召回 p95（目标 500ms）</div></div>
+      <div class="metric"><div class="value">100k</div><div class="label">基准事件规模</div></div>
+      <div class="metric"><div class="value">115</div><div class="label">自动化测试全部通过</div></div>
+    </div>
+    <p>这两个 p95 不是巧合，而是被当作<strong>发布门</strong>：基准曾暴露过实体边缺索引导致的 O(n²) 写入、以及召回 SQL 物化全表导致的 647ms 延迟，都在发布前被修复并加了回归测试。</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="num">08</span>快速开始</h2>
+    <pre><code># 构建并链接（需要 Node.js 22+ 和 pnpm 10）
+pnpm install && pnpm build && pnpm link --global
+
+# 启动本地守护进程并自检
+memoryctl start
+memoryctl doctor
+
+# 在目标项目里安装 Agent 适配器（Claude Code / Codex）
+cd 你的项目
+memoryctl install all --scope project
+
+# 可选：接入 Obsidian
+memoryctl import-obsidian /path/to/vault   # 笔记 → 记忆
+memoryctl export-obsidian /path/to/vault   # 记忆 → 笔记</code></pre>
+    <div class="warn-box">
+      <strong>安全边界：</strong>daemon 只监听本机回环地址，无 TLS 与多用户隔离；导出到 Obsidian 的抄本是明文，会进入 vault 自己的同步范围；丢失 <code>~/.memoryd/master.key</code> 则加密内容不可恢复。
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    memoryd · 本地优先的长期记忆运行时 · 设计文档见仓库《记忆架构.md》《记忆架构讨论原文.md》<br>
+    危险识别 → 模式切换 → 门控混合检索 → 原文工作集 → 验证 → 纠错 → shadow/replay 学习
+  </div>
+</footer>
+
+</body>
+</html>
