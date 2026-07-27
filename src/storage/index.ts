@@ -6,10 +6,23 @@ import {
   PROTOCOL_VERSION,
   ProtocolError,
   type AgentProfile,
+  type Contradiction,
   type CorrectionInput,
   type EpisodeMemory,
   type InputEvent,
+  type MaintenanceAction,
+  type MaintenanceJob,
+  type MaintenanceJobStatus,
+  type MaintenanceJobType,
+  type MemoryObject,
+  type MemoryObjectMember,
+  type MemoryPartition,
+  type MemoryQualityMetrics,
+  type MemoryRelation,
+  type MemoryTemperature,
+  type MemoryVersion,
   type Observation,
+  type RetrievalTrace,
   type ScopeRef,
   type SourceEvent,
   type SourceRef,
@@ -39,6 +52,8 @@ import type {
   MemoryStoreOptions,
   LearningJobRecord,
   LearningJobType,
+  MaintenanceAuditRecord,
+  MemoryObjectRouteHit,
   OwnerMetadata,
   PolicyApprovalEligibility,
   ReindexResult,
@@ -94,6 +109,14 @@ interface ExportPackage {
     calibrationPatterns: CalibrationPatternRecord[];
     sessions: SessionLifecycleRecord[];
     triggerActivations: TriggerActivationRecord[];
+    memoryPartitions?: MemoryPartition[];
+    memoryObjects?: MemoryObject[];
+    memoryObjectMembers?: MemoryObjectMember[];
+    memoryRelations?: MemoryRelation[];
+    memoryVersions?: MemoryVersion[];
+    contradictions?: Contradiction[];
+    memoryTemperatures?: MemoryTemperature[];
+    retrievalTraces?: RetrievalTrace[];
     tombstones: Array<Record<string, unknown>>;
   };
 }
@@ -155,6 +178,10 @@ export class MemoryStore {
 
   getIndexRevision(): number {
     return this.getMetadataNumber("index_revision");
+  }
+
+  getMemoryGeneration(): number {
+    return this.getMetadataNumber("memory_generation");
   }
 
   appendSourceEvent(args: AppendSourceEventArgs): SourceEvent;
@@ -308,6 +335,7 @@ export class MemoryStore {
         requestHash,
         revision,
       );
+      this.touchMemoryScope(event.scope, capturedAt);
       this.touchIndex(revision);
       return event;
     })();
@@ -788,6 +816,30 @@ export class MemoryStore {
     return rows.map((row) => this.decodeWorldClaim(row));
   }
 
+  listUnassignedWorldClaims(
+    scope: ScopeRef,
+    includeAllSessions = false,
+    limit = 500,
+  ): WorldClaim[] {
+    const rows = this.database.prepare(`
+      SELECT w.* FROM world_claims w
+      WHERE ${this.aclSql(!includeAllSessions, "w")}
+        AND w.status IN ('active', 'disputed')
+        AND NOT EXISTS (
+          SELECT 1 FROM memory_object_members m
+          WHERE m.member_type = 'semantic'
+            AND m.member_id = (w.claim_id || '${OWNER_ID_SEPARATOR}' || w.version)
+            AND m.status = 'active'
+        )
+      ORDER BY w.revision, w.claim_id, w.version
+      LIMIT @limit
+    `).all({
+      ...this.aclParams(scope),
+      limit: Math.max(1, Math.min(limit, 5_000)),
+    }) as Row[];
+    return rows.map((row) => this.decodeWorldClaim(row));
+  }
+
   putPolicy(policy: StoredPolicy, idempotencyKey?: string): StoredPolicy {
     this.requireWritable();
     const sanitized = redactSensitiveValue(policy).value;
@@ -1062,6 +1114,26 @@ export class MemoryStore {
       limit: Math.max(1, Math.min(limit, 5_000)),
     }) as Row[];
     return rows.map((row) => this.open<EpisodeMemory>("episode", String(row.episode_id), String(row.encrypted_payload)));
+  }
+
+  listUnassignedEpisodes(scope: ScopeRef, limit = 500): EpisodeMemory[] {
+    const rows = this.database.prepare(`
+      SELECT e.* FROM episodes e
+      WHERE ${this.aclSql(false, "e")}
+        AND NOT EXISTS (
+          SELECT 1 FROM memory_object_members m
+          WHERE m.member_type = 'episode'
+            AND m.member_id = e.episode_id
+            AND m.status = 'active'
+        )
+      ORDER BY e.revision, e.episode_id
+      LIMIT @limit
+    `).all({
+      ...this.aclParams(scope),
+      limit: Math.max(1, Math.min(limit, 5_000)),
+    }) as Row[];
+    return rows.map((row) =>
+      this.open<EpisodeMemory>("episode", String(row.episode_id), String(row.encrypted_payload)));
   }
 
   /** Remove only the rebuildable Episode index; authoritative SourceEvents remain untouched. */
@@ -1623,6 +1695,1308 @@ export class MemoryStore {
     ));
   }
 
+  putMemoryPartition(partition: MemoryPartition): MemoryPartition {
+    this.requireWritable();
+    const sanitized = redactSensitiveValue(partition).value;
+    if (sanitized.capacity < 1 || sanitized.depth < 0 || sanitized.version < 1) {
+      throw new ProtocolError({ code: "INVALID_REQUEST", message: "Memory partition bounds are invalid" });
+    }
+    const existing = this.getMemoryPartition(sanitized.partitionId);
+    if (existing !== undefined && existing.version > sanitized.version) {
+      this.versionConflict(`Memory partition ${sanitized.partitionId} version moved backwards`);
+    }
+    const recordHash = sha256(canonicalJson(sanitized));
+    const existingRow = this.database.prepare("SELECT * FROM memory_partitions WHERE partition_id = ?")
+      .get(sanitized.partitionId) as Row | undefined;
+    if (existingRow !== undefined && String(existingRow.record_hash) === recordHash) return existing as MemoryPartition;
+    if (existingRow === undefined) this.assertNotTombstoned("memory_partition", sanitized.partitionId);
+    return this.database.transaction(() => {
+      const revision = this.nextRevision();
+      if (existingRow === undefined) {
+        this.database.prepare(`
+          INSERT INTO memory_partitions(
+            partition_id, revision, user_id, workspace_id, session_id, namespace,
+            partition_key, strategy, status, parent_partition_id, depth, child_count,
+            object_count, capacity, version, created_at, updated_at, encrypted_payload, record_hash
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          sanitized.partitionId,
+          revision,
+          sanitized.scope.userId,
+          sanitized.scope.workspaceId ?? null,
+          sanitized.scope.sessionId ?? null,
+          sanitized.namespace,
+          sanitized.partitionKey,
+          sanitized.strategy,
+          sanitized.status,
+          sanitized.parentPartitionId ?? null,
+          sanitized.depth,
+          sanitized.childCount,
+          sanitized.objectCount,
+          sanitized.capacity,
+          sanitized.version,
+          sanitized.createdAt,
+          sanitized.updatedAt,
+          this.seal("memory_partition", sanitized.partitionId, sanitized),
+          recordHash,
+        );
+      } else {
+        this.assertAcl(existingRow, sanitized.scope, true);
+        this.database.prepare(`
+          UPDATE memory_partitions SET revision = ?, namespace = ?, partition_key = ?,
+            strategy = ?, status = ?, parent_partition_id = ?, depth = ?, child_count = ?,
+            object_count = ?, capacity = ?, version = ?, updated_at = ?,
+            encrypted_payload = ?, record_hash = ? WHERE partition_id = ?
+        `).run(
+          revision,
+          sanitized.namespace,
+          sanitized.partitionKey,
+          sanitized.strategy,
+          sanitized.status,
+          sanitized.parentPartitionId ?? null,
+          sanitized.depth,
+          sanitized.childCount,
+          sanitized.objectCount,
+          sanitized.capacity,
+          sanitized.version,
+          sanitized.updatedAt,
+          this.seal("memory_partition", sanitized.partitionId, sanitized),
+          recordHash,
+          sanitized.partitionId,
+        );
+      }
+      this.bumpMemoryGeneration();
+      return sanitized;
+    })();
+  }
+
+  getMemoryPartition(partitionId: string, scope?: ScopeRef): MemoryPartition | undefined {
+    const row = this.database.prepare("SELECT * FROM memory_partitions WHERE partition_id = ?")
+      .get(partitionId) as Row | undefined;
+    if (row === undefined) return undefined;
+    if (scope !== undefined) this.assertAcl(row, scope, true);
+    return this.decodeMemoryPartition(row);
+  }
+
+  listMemoryPartitions(
+    scope: ScopeRef,
+    options: { includeArchived?: boolean; parentPartitionId?: string; limit?: number } = {},
+  ): MemoryPartition[] {
+    const rows = this.database.prepare(`
+      SELECT * FROM memory_partitions
+      WHERE ${this.aclSql(true)}
+        AND (@includeArchived = 1 OR status != 'archived')
+        AND (@parentPartitionId IS NULL OR parent_partition_id = @parentPartitionId)
+      ORDER BY depth, updated_at DESC, partition_id
+      LIMIT @limit
+    `).all({
+      ...this.aclParams(scope),
+      includeArchived: options.includeArchived ? 1 : 0,
+      parentPartitionId: options.parentPartitionId ?? null,
+      limit: Math.max(1, Math.min(options.limit ?? 500, 5_000)),
+    }) as Row[];
+    return rows.map((row) => this.decodeMemoryPartition(row));
+  }
+
+  putMemoryObject(object: MemoryObject): MemoryObject {
+    this.requireWritable();
+    const sanitized = redactSensitiveValue(object).value;
+    if (sanitized.evidenceRefs.length === 0) {
+      throw new ProtocolError({ code: "INVALID_REQUEST", message: "Memory objects require authoritative evidence" });
+    }
+    this.assertSourceRefs(sanitized.evidenceRefs, sanitized.scope);
+    if (
+      sanitized.version < 1 ||
+      sanitized.schemaVersion < 1 ||
+      sanitized.tokenEstimate < 0 ||
+      sanitized.memberCount < 0 ||
+      sanitized.childCount < 0 ||
+      !Number.isFinite(sanitized.confidence) ||
+      sanitized.confidence < 0 ||
+      sanitized.confidence > 1
+    ) {
+      throw new ProtocolError({ code: "INVALID_REQUEST", message: "Memory object bounds are invalid" });
+    }
+    const partition = this.getMemoryPartition(sanitized.partitionId, sanitized.scope);
+    if (partition === undefined) this.notFound(`Memory partition ${sanitized.partitionId} was not found`);
+    const existingRow = this.database.prepare("SELECT * FROM memory_objects WHERE object_id = ?")
+      .get(sanitized.objectId) as Row | undefined;
+    const existing = existingRow === undefined ? undefined : this.decodeMemoryObject(existingRow);
+    if (existing !== undefined && existing.version > sanitized.version) {
+      this.versionConflict(`Memory object ${sanitized.objectId} version moved backwards`);
+    }
+    const recordHash = sha256(canonicalJson(sanitized));
+    if (existingRow !== undefined && String(existingRow.record_hash) === recordHash) return existing as MemoryObject;
+    if (existingRow === undefined) this.assertNotTombstoned("memory_object", sanitized.objectId);
+    return this.database.transaction(() => {
+      const revision = this.nextRevision();
+      if (existingRow === undefined) {
+        this.database.prepare(`
+          INSERT INTO memory_objects(
+            object_id, revision, user_id, workspace_id, session_id, partition_id,
+            parent_object_id, object_type, title, status, temperature, token_estimate,
+            child_count, member_count, confidence, version, schema_version,
+            summarizer_version, created_at, updated_at, encrypted_payload, record_hash
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          sanitized.objectId,
+          revision,
+          sanitized.scope.userId,
+          sanitized.scope.workspaceId ?? null,
+          sanitized.scope.sessionId ?? null,
+          sanitized.partitionId,
+          sanitized.parentObjectId ?? null,
+          sanitized.objectType,
+          sanitized.title,
+          sanitized.status,
+          sanitized.temperature,
+          sanitized.tokenEstimate,
+          sanitized.childCount,
+          sanitized.memberCount,
+          sanitized.confidence,
+          sanitized.version,
+          sanitized.schemaVersion,
+          sanitized.summarizerVersion,
+          sanitized.createdAt,
+          sanitized.updatedAt,
+          this.seal("memory_object", sanitized.objectId, sanitized),
+          recordHash,
+        );
+      } else {
+        this.assertAcl(existingRow, sanitized.scope, true);
+        this.database.prepare(`
+          UPDATE memory_objects SET revision = ?, partition_id = ?, parent_object_id = ?,
+            object_type = ?, title = ?, status = ?, temperature = ?, token_estimate = ?,
+            child_count = ?, member_count = ?, confidence = ?, version = ?,
+            schema_version = ?, summarizer_version = ?, updated_at = ?,
+            encrypted_payload = ?, record_hash = ? WHERE object_id = ?
+        `).run(
+          revision,
+          sanitized.partitionId,
+          sanitized.parentObjectId ?? null,
+          sanitized.objectType,
+          sanitized.title,
+          sanitized.status,
+          sanitized.temperature,
+          sanitized.tokenEstimate,
+          sanitized.childCount,
+          sanitized.memberCount,
+          sanitized.confidence,
+          sanitized.version,
+          sanitized.schemaVersion,
+          sanitized.summarizerVersion,
+          sanitized.updatedAt,
+          this.seal("memory_object", sanitized.objectId, sanitized),
+          recordHash,
+          sanitized.objectId,
+        );
+      }
+      this.database.prepare("DELETE FROM memory_objects_fts WHERE object_id = ?").run(sanitized.objectId);
+      // Object retrieval is deliberately partition-local. Keeping every
+      // object in one physical FTS posting list would simply move the
+      // unbounded-index problem up one layer. The legacy v7 FTS table remains
+      // empty for migration compatibility and can be removed in a future
+      // major schema cleanup.
+      this.database.prepare("DELETE FROM source_links WHERE owner_type = 'memory_object' AND owner_id = ?")
+        .run(sanitized.objectId);
+      this.linkSources("memory_object", sanitized.objectId, sanitized.evidenceRefs);
+      this.touchIndex(revision);
+      this.bumpMemoryGeneration();
+      return sanitized;
+    })();
+  }
+
+  getMemoryObject(objectId: string, scope?: ScopeRef): MemoryObject | undefined {
+    const row = this.database.prepare("SELECT * FROM memory_objects WHERE object_id = ?")
+      .get(objectId) as Row | undefined;
+    if (row === undefined) return undefined;
+    if (scope !== undefined) this.assertAcl(row, scope, true);
+    return this.decodeMemoryObject(row);
+  }
+
+  listMemoryObjects(
+    scope: ScopeRef,
+    options: {
+      partitionIds?: readonly string[];
+      statuses?: readonly MemoryObject["status"][];
+      temperatures?: readonly MemoryObject["temperature"][];
+      maxRevision?: number;
+      limit?: number;
+    } = {},
+  ): MemoryObject[] {
+    const partitions = options.partitionIds ?? [];
+    const statuses = options.statuses ?? [];
+    const temperatures = options.temperatures ?? [];
+    const partitionSql = partitions.length === 0
+      ? ""
+      : `AND partition_id IN (${partitions.map((_, index) => `@partition${index}`).join(", ")})`;
+    const statusSql = statuses.length === 0
+      ? ""
+      : `AND status IN (${statuses.map((_, index) => `@status${index}`).join(", ")})`;
+    const temperatureSql = temperatures.length === 0
+      ? ""
+      : `AND temperature IN (${temperatures.map((_, index) => `@temperature${index}`).join(", ")})`;
+    const rows = this.database.prepare(`
+      SELECT * FROM memory_objects
+      WHERE ${this.aclSql(true)} AND revision <= @maxRevision
+        ${partitionSql} ${statusSql} ${temperatureSql}
+      ORDER BY
+        CASE temperature WHEN 'hot' THEN 4 WHEN 'warm' THEN 3 WHEN 'cold' THEN 2 ELSE 1 END DESC,
+        updated_at DESC, object_id
+      LIMIT @limit
+    `).all({
+      ...this.aclParams(scope),
+      maxRevision: Math.min(options.maxRevision ?? this.getRevision(), this.getRevision()),
+      limit: Math.max(1, Math.min(options.limit ?? 500, 5_000)),
+      ...Object.fromEntries(partitions.map((value, index) => [`partition${index}`, value])),
+      ...Object.fromEntries(statuses.map((value, index) => [`status${index}`, value])),
+      ...Object.fromEntries(temperatures.map((value, index) => [`temperature${index}`, value])),
+    }) as Row[];
+    return rows.map((row) => this.decodeMemoryObject(row));
+  }
+
+  /** Workspace-level scopes with authoritative or derived memory, for bounded background maintenance. */
+  listMemoryScopes(limit = 500): ScopeRef[] {
+    const rows = this.database.prepare(`
+      SELECT user_id, workspace_id FROM memory_scope_registry
+      ORDER BY
+        CASE WHEN last_scheduled_at IS NULL THEN 0 ELSE 1 END,
+        last_scheduled_at,
+        last_activity_at DESC,
+        user_id,
+        workspace_key
+      LIMIT ?
+    `).all(Math.max(1, Math.min(limit, 5_000))) as Row[];
+    return rows.map((row) => ({
+      userId: String(row.user_id),
+      ...(row.workspace_id === null || row.workspace_id === undefined
+        ? {}
+        : { workspaceId: String(row.workspace_id) }),
+    }));
+  }
+
+  markMemoryScopeScheduled(scope: ScopeRef, at = this.isoNow()): void {
+    this.requireWritable();
+    this.database.prepare(`
+      UPDATE memory_scope_registry SET last_scheduled_at = ?
+      WHERE user_id = ? AND workspace_key = ?
+    `).run(at, scope.userId, scope.workspaceId ?? "");
+  }
+
+  routeMemoryPartitions(
+    query: string,
+    scope: ScopeRef,
+    options: {
+      includeArchive?: boolean;
+      maxRevision?: number;
+      limit?: number;
+      maxDepth?: number;
+    } = {},
+  ): MemoryPartition[] {
+    const maxRevision = Math.min(options.maxRevision ?? this.getRevision(), this.getRevision());
+    const limit = Math.max(1, Math.min(options.limit ?? 8, 40));
+    const maxDepth = Math.max(1, Math.min(options.maxDepth ?? 3, 12));
+    const statusSql = options.includeArchive
+      ? "status IN ('active', 'router', 'archived')"
+      : "status IN ('active', 'router')";
+    const roots = (this.database.prepare(`
+      SELECT * FROM memory_partitions
+      WHERE ${this.aclSql(true)} AND parent_partition_id IS NULL
+        AND revision <= @maxRevision AND ${statusSql}
+      ORDER BY updated_at DESC, partition_id
+      LIMIT @limit
+    `).all({
+      ...this.aclParams(scope),
+      maxRevision,
+      limit,
+    }) as Row[]).map((row) => this.decodeMemoryPartition(row));
+    if (roots.length === 0) return [];
+
+    const normalizedQuery = query.normalize("NFKC").toLocaleLowerCase("und");
+    const queryTokens = new Set(normalizedQuery.match(/[\p{L}\p{N}_.:/#-]{2,}/gu) ?? []);
+    const score = (partition: MemoryPartition): number => {
+      if (queryTokens.size === 0) return 0;
+      const keys = [
+        partition.partitionKey,
+        partition.namespace,
+        ...partition.routingKeys,
+      ].map((value) => value.normalize("NFKC").toLocaleLowerCase("und"));
+      const matches = keys.filter((key) =>
+        queryTokens.has(key) || normalizedQuery.includes(key) ||
+        [...queryTokens].some((token) => key.includes(token)));
+      if (matches.length === 0) return 0;
+      // A specific entity/project key must outrank a short shared topic such as
+      // "deployment"; otherwise a bounded partition router can select the
+      // wrong local shard even when the query names the entity exactly.
+      const specificity = Math.max(...matches.map((key) => Math.min(160, key.length))) / 160;
+      return specificity + matches.length / Math.max(1, keys.length) / 10;
+    };
+    const rank = (partitions: MemoryPartition[]): MemoryPartition[] =>
+      [...partitions].sort((left, right) =>
+        score(right) - score(left) ||
+        right.updatedAt.localeCompare(left.updatedAt) ||
+        left.partitionId.localeCompare(right.partitionId)).slice(0, limit);
+
+    let frontier = rank(roots);
+    const leaves: MemoryPartition[] = [];
+    const visited = new Set<string>();
+    for (let depth = 0; depth < maxDepth && frontier.length > 0; depth += 1) {
+      const children: MemoryPartition[] = [];
+      for (const partition of frontier) {
+        if (visited.has(partition.partitionId)) continue;
+        visited.add(partition.partitionId);
+        if (partition.status !== "router") {
+          leaves.push(partition);
+          continue;
+        }
+        const rows = this.database.prepare(`
+          SELECT * FROM memory_partitions
+          WHERE ${this.aclSql(true)} AND parent_partition_id = @parentPartitionId
+            AND revision <= @maxRevision AND ${statusSql}
+          ORDER BY updated_at DESC, partition_id
+          LIMIT @limit
+        `).all({
+          ...this.aclParams(scope),
+          parentPartitionId: partition.partitionId,
+          maxRevision,
+          limit: Math.max(limit, Math.min(partition.capacity, 100)),
+        }) as Row[];
+        if (rows.length === 0) leaves.push(partition);
+        else children.push(...rows.map((row) => this.decodeMemoryPartition(row)));
+      }
+      frontier = rank(children);
+    }
+    leaves.push(...frontier);
+    const unique = new Map(leaves.map((partition) => [partition.partitionId, partition]));
+    return rank([...unique.values()]);
+  }
+
+  routeMemoryObjects(
+    query: string,
+    scope: ScopeRef,
+    options: {
+      includeArchive?: boolean;
+      maxRevision?: number;
+      limit?: number;
+      candidateLimit?: number;
+      partitionLimit?: number;
+      maxPartitionDepth?: number;
+    } = {},
+  ): MemoryObjectRouteHit[] {
+    const maxRevision = Math.min(options.maxRevision ?? this.getRevision(), this.getRevision());
+    const candidateLimit = Math.max(4, Math.min(options.candidateLimit ?? 80, 500));
+    const requestedLimit = Math.max(1, Math.min(options.limit ?? 8, 40));
+    const partitions = this.routeMemoryPartitions(query, scope, {
+      maxRevision,
+      limit: options.partitionLimit ?? requestedLimit,
+      ...(options.includeArchive === undefined ? {} : { includeArchive: options.includeArchive }),
+      ...(options.maxPartitionDepth === undefined ? {} : { maxDepth: options.maxPartitionDepth }),
+    });
+    if (partitions.length === 0) return [];
+    const partitionParams = Object.fromEntries(
+      partitions.map((partition, index) => [`routePartition${index}`, partition.partitionId]),
+    );
+    const partitionSql = `o.partition_id IN (${
+      partitions.map((_, index) => `@routePartition${index}`).join(", ")
+    })`;
+    const rawRows = this.database.prepare(`
+      SELECT o.* FROM memory_objects o
+      WHERE ${this.aclSql(true, "o")} AND o.revision <= @maxRevision
+        AND ${partitionSql}
+        AND o.status IN ('active', 'router', 'archived')
+      ORDER BY
+        CASE o.temperature WHEN 'hot' THEN 3 WHEN 'warm' THEN 2 WHEN 'cold' THEN 1 ELSE 0 END DESC,
+        o.updated_at DESC, o.object_id
+      LIMIT @candidateLimit
+    `).all({
+      ...this.aclParams(scope),
+      ...partitionParams,
+      maxRevision,
+      candidateLimit,
+    }) as Row[];
+    const queryNormalized = query.normalize("NFKC").toLocaleLowerCase("und");
+    const queryTokens = new Set(queryNormalized.match(/[\p{L}\p{N}_.:/#-]{2,}/gu) ?? []);
+    const hits: MemoryObjectRouteHit[] = [];
+    for (const row of rawRows) {
+      const storedObject = this.decodeMemoryObject(row);
+      const effectiveTemperature = this.getMemoryTemperature("object", storedObject.objectId, scope)?.tier
+        ?? storedObject.temperature;
+      const object = effectiveTemperature === storedObject.temperature
+        ? storedObject
+        : { ...storedObject, temperature: effectiveTemperature };
+      const keys = [object.title, ...object.routingKeys, ...object.entityKeys]
+        .map((value) => value.normalize("NFKC").toLocaleLowerCase("und"));
+      const keyMatches = (key: string): boolean =>
+        key.length > 1 && (queryTokens.has(key) || queryNormalized.includes(key));
+      const exact = keys.some(keyMatches);
+      const exactEntity = object.entityKeys
+        .map((value) => value.normalize("NFKC").toLocaleLowerCase("und"))
+        .some(keyMatches);
+      const exactTitle = keyMatches(object.title.normalize("NFKC").toLocaleLowerCase("und"));
+      const longestMatch = Math.max(0, ...keys.filter(keyMatches).map((key) => key.length));
+      const searchable = [
+        object.title,
+        object.summary,
+        ...object.routingKeys,
+        ...object.entityKeys,
+      ].join("\n").normalize("NFKC").toLocaleLowerCase("und");
+      const lexicalMatches = [...queryTokens].filter((token) =>
+        searchable.includes(token) || token.includes(object.title.normalize("NFKC").toLocaleLowerCase("und")));
+      const lexical = queryTokens.size === 0 ? 0 : lexicalMatches.length / queryTokens.size;
+      if (queryTokens.size === 0 && object.temperature !== "hot" && object.temperature !== "warm") continue;
+      if (queryTokens.size > 0 && lexical === 0 && !exact) continue;
+      if (object.temperature === "cold" && !exact) continue;
+      if (object.temperature === "archive" && !options.includeArchive) continue;
+      const tierBoost = object.temperature === "hot" ? 0.2 : object.temperature === "warm" ? 0.1 : 0;
+      const exactBoost = exactEntity
+        ? 1
+        : exactTitle
+          ? 0.8
+          : Math.min(0.6, longestMatch / 40);
+      hits.push({ object, score: Number((lexical + tierBoost + exactBoost).toFixed(6)), exact });
+    }
+    return hits
+      .sort((left, right) => right.score - left.score || right.object.updatedAt.localeCompare(left.object.updatedAt))
+      .slice(0, requestedLimit);
+  }
+
+  putMemoryObjectMember(member: MemoryObjectMember): MemoryObjectMember {
+    this.requireWritable();
+    const object = this.getMemoryObject(member.objectId);
+    if (object === undefined) this.notFound(`Memory object ${member.objectId} was not found`);
+    const sanitized = redactSensitiveValue(member).value;
+    return this.database.transaction(() => {
+      const revision = this.nextRevision();
+      this.database.prepare(`
+        INSERT INTO memory_object_members(
+          object_id, member_type, member_id, role, score, status, revision,
+          added_at, updated_at, origin_action_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(object_id, member_type, member_id) DO UPDATE SET
+          role = excluded.role, score = excluded.score, status = excluded.status,
+          revision = excluded.revision, updated_at = excluded.updated_at,
+          origin_action_id = excluded.origin_action_id
+      `).run(
+        sanitized.objectId,
+        sanitized.memberType,
+        sanitized.memberId,
+        sanitized.role,
+        sanitized.score,
+        sanitized.status,
+        revision,
+        sanitized.addedAt,
+        sanitized.updatedAt,
+        sanitized.originActionId ?? null,
+      );
+      this.bumpMemoryGeneration();
+      return sanitized;
+    })();
+  }
+
+  listMemoryObjectMembers(
+    objectId: string,
+    scope?: ScopeRef,
+    includeRemoved = false,
+  ): MemoryObjectMember[] {
+    const object = this.getMemoryObject(objectId, scope);
+    if (object === undefined) return [];
+    const rows = this.database.prepare(`
+      SELECT * FROM memory_object_members
+      WHERE object_id = ? AND (? = 1 OR status = 'active')
+      ORDER BY score DESC, added_at, member_type, member_id
+    `).all(objectId, includeRemoved ? 1 : 0) as Row[];
+    return rows.map((row) => this.decodeMemoryObjectMember(row));
+  }
+
+  listObjectsForMember(
+    memberType: MemoryObjectMember["memberType"],
+    memberId: string,
+    scope: ScopeRef,
+  ): MemoryObject[] {
+    const rows = this.database.prepare(`
+      SELECT o.* FROM memory_object_members m
+      JOIN memory_objects o ON o.object_id = m.object_id
+      WHERE m.member_type = @memberType AND m.member_id = @memberId AND m.status = 'active'
+        AND ${this.aclSql(true, "o")}
+      ORDER BY o.updated_at DESC, o.object_id
+    `).all({ memberType, memberId, ...this.aclParams(scope) }) as Row[];
+    return rows.map((row) => this.decodeMemoryObject(row));
+  }
+
+  putMemoryRelation(relation: MemoryRelation): MemoryRelation {
+    this.requireWritable();
+    const sanitized = redactSensitiveValue(relation).value;
+    if (!Number.isFinite(sanitized.confidence) || sanitized.confidence < 0 || sanitized.confidence > 1) {
+      throw new ProtocolError({ code: "INVALID_REQUEST", message: "Memory relation confidence is invalid" });
+    }
+    this.assertSourceRefs(sanitized.evidenceRefs, sanitized.scope);
+    const existingRow = this.database.prepare("SELECT * FROM memory_relations WHERE relation_id = ?")
+      .get(sanitized.relationId) as Row | undefined;
+    const existing = existingRow === undefined ? undefined : this.decodeMemoryRelation(existingRow);
+    if (existing !== undefined && existing.version > sanitized.version) {
+      this.versionConflict(`Memory relation ${sanitized.relationId} version moved backwards`);
+    }
+    const recordHash = sha256(canonicalJson(sanitized));
+    if (existingRow !== undefined && String(existingRow.record_hash) === recordHash) return existing as MemoryRelation;
+    if (existingRow === undefined) this.assertNotTombstoned("memory_relation", sanitized.relationId);
+    return this.database.transaction(() => {
+      const revision = this.nextRevision();
+      if (existingRow === undefined) {
+        this.database.prepare(`
+          INSERT INTO memory_relations(
+            relation_id, revision, user_id, workspace_id, session_id,
+            from_type, from_id, to_type, to_id, relation_type, status,
+            confidence, version, created_at, updated_at, encrypted_payload, record_hash
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          sanitized.relationId,
+          revision,
+          sanitized.scope.userId,
+          sanitized.scope.workspaceId ?? null,
+          sanitized.scope.sessionId ?? null,
+          sanitized.from.type,
+          sanitized.from.id,
+          sanitized.to.type,
+          sanitized.to.id,
+          sanitized.relation,
+          sanitized.status,
+          sanitized.confidence,
+          sanitized.version,
+          sanitized.createdAt,
+          sanitized.updatedAt,
+          this.seal("memory_relation", sanitized.relationId, sanitized),
+          recordHash,
+        );
+      } else {
+        this.assertAcl(existingRow, sanitized.scope, true);
+        this.database.prepare(`
+          UPDATE memory_relations SET revision = ?, from_type = ?, from_id = ?,
+            to_type = ?, to_id = ?, relation_type = ?, status = ?, confidence = ?,
+            version = ?, updated_at = ?, encrypted_payload = ?, record_hash = ?
+          WHERE relation_id = ?
+        `).run(
+          revision,
+          sanitized.from.type,
+          sanitized.from.id,
+          sanitized.to.type,
+          sanitized.to.id,
+          sanitized.relation,
+          sanitized.status,
+          sanitized.confidence,
+          sanitized.version,
+          sanitized.updatedAt,
+          this.seal("memory_relation", sanitized.relationId, sanitized),
+          recordHash,
+          sanitized.relationId,
+        );
+      }
+      this.database.prepare("DELETE FROM source_links WHERE owner_type = 'memory_relation' AND owner_id = ?")
+        .run(sanitized.relationId);
+      if (sanitized.evidenceRefs.length > 0) {
+        this.linkSources("memory_relation", sanitized.relationId, sanitized.evidenceRefs);
+      }
+      this.bumpMemoryGeneration();
+      return sanitized;
+    })();
+  }
+
+  getMemoryRelation(relationId: string, scope?: ScopeRef): MemoryRelation | undefined {
+    const row = this.database.prepare("SELECT * FROM memory_relations WHERE relation_id = ?")
+      .get(relationId) as Row | undefined;
+    if (row === undefined) return undefined;
+    if (scope !== undefined) this.assertAcl(row, scope, true);
+    return this.decodeMemoryRelation(row);
+  }
+
+  listMemoryRelations(
+    scope: ScopeRef,
+    options: {
+      nodeType?: string;
+      nodeId?: string;
+      relation?: MemoryRelation["relation"];
+      includeInactive?: boolean;
+      limit?: number;
+    } = {},
+  ): MemoryRelation[] {
+    const rows = this.database.prepare(`
+      SELECT * FROM memory_relations
+      WHERE ${this.aclSql(true)}
+        AND (@includeInactive = 1 OR status IN ('active', 'disputed'))
+        AND (@nodeId IS NULL OR (
+          (from_id = @nodeId AND (@nodeType IS NULL OR from_type = @nodeType))
+          OR (to_id = @nodeId AND (@nodeType IS NULL OR to_type = @nodeType))
+        ))
+        AND (@relation IS NULL OR relation_type = @relation)
+      ORDER BY updated_at DESC, relation_id
+      LIMIT @limit
+    `).all({
+      ...this.aclParams(scope),
+      includeInactive: options.includeInactive ? 1 : 0,
+      nodeType: options.nodeType ?? null,
+      nodeId: options.nodeId ?? null,
+      relation: options.relation ?? null,
+      limit: Math.max(1, Math.min(options.limit ?? 500, 5_000)),
+    }) as Row[];
+    return rows.map((row) => this.decodeMemoryRelation(row));
+  }
+
+  putMemoryVersion(version: MemoryVersion): MemoryVersion {
+    this.requireWritable();
+    const sanitized = redactSensitiveValue(version).value;
+    this.assertUnscopedSourceRefs(sanitized.evidenceRefs);
+    const written = this.putAuxiliary(
+      "memory_version",
+      "memory_versions",
+      "version_id",
+      sanitized.versionId,
+      sanitized,
+      ["memory_type", "memory_id", "version", "operation", "maintenance_action_id", "created_at"],
+      [
+        sanitized.memoryType,
+        sanitized.memoryId,
+        sanitized.version,
+        sanitized.operation,
+        sanitized.maintenanceActionId ?? null,
+        sanitized.createdAt,
+      ],
+    );
+    if (written.evidenceRefs.length > 0) {
+      this.linkSources("memory_version", written.versionId, written.evidenceRefs);
+    }
+    return written;
+  }
+
+  listMemoryVersions(memoryType: MemoryVersion["memoryType"], memoryId: string): MemoryVersion[] {
+    const rows = this.database.prepare(`
+      SELECT * FROM memory_versions WHERE memory_type = ? AND memory_id = ?
+      ORDER BY version, revision
+    `).all(memoryType, memoryId) as Row[];
+    return rows.map((row) =>
+      this.open<MemoryVersion>("memory_version", String(row.version_id), String(row.encrypted_payload)));
+  }
+
+  putContradiction(contradiction: Contradiction): Contradiction {
+    this.requireWritable();
+    const sanitized = redactSensitiveValue(contradiction).value;
+    if (sanitized.evidenceRefs.length === 0) {
+      throw new ProtocolError({ code: "INVALID_REQUEST", message: "Contradictions require evidence" });
+    }
+    this.assertSourceRefs(sanitized.evidenceRefs, sanitized.scope);
+    const oldClaim = this.getWorldClaim(
+      sanitized.oldClaim.claimId,
+      sanitized.oldClaim.version,
+      sanitized.scope,
+    );
+    const newClaim = this.getWorldClaim(
+      sanitized.newClaim.claimId,
+      sanitized.newClaim.version,
+      sanitized.scope,
+    );
+    if (oldClaim === undefined || newClaim === undefined) {
+      this.notFound("Contradiction claim dependency was not found");
+    }
+    const existingRow = this.database.prepare("SELECT * FROM contradictions WHERE contradiction_id = ?")
+      .get(sanitized.contradictionId) as Row | undefined;
+    const existing = existingRow === undefined ? undefined : this.decodeContradiction(existingRow);
+    if (existing !== undefined && existing.version > sanitized.version) {
+      this.versionConflict(`Contradiction ${sanitized.contradictionId} version moved backwards`);
+    }
+    const recordHash = sha256(canonicalJson(sanitized));
+    if (existingRow !== undefined && String(existingRow.record_hash) === recordHash) return existing as Contradiction;
+    if (existingRow === undefined) this.assertNotTombstoned("contradiction", sanitized.contradictionId);
+    return this.database.transaction(() => {
+      const revision = this.nextRevision();
+      const values = [
+        sanitized.scope.userId,
+        sanitized.scope.workspaceId ?? null,
+        sanitized.scope.sessionId ?? null,
+        sanitized.oldClaim.claimId,
+        sanitized.oldClaim.version,
+        sanitized.newClaim.claimId,
+        sanitized.newClaim.version,
+        sanitized.currentPreferredClaim?.claimId ?? null,
+        sanitized.currentPreferredClaim?.version ?? null,
+        sanitized.status,
+        sanitized.version,
+        sanitized.createdAt,
+        sanitized.updatedAt,
+        this.seal("contradiction", sanitized.contradictionId, sanitized),
+        recordHash,
+      ];
+      if (existingRow === undefined) {
+        this.database.prepare(`
+          INSERT INTO contradictions(
+            contradiction_id, revision, user_id, workspace_id, session_id,
+            old_claim_id, old_claim_version, new_claim_id, new_claim_version,
+            preferred_claim_id, preferred_claim_version, status, version,
+            created_at, updated_at, encrypted_payload, record_hash
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(sanitized.contradictionId, revision, ...values);
+      } else {
+        this.assertAcl(existingRow, sanitized.scope, true);
+        this.database.prepare(`
+          UPDATE contradictions SET revision = ?, user_id = ?, workspace_id = ?, session_id = ?,
+            old_claim_id = ?, old_claim_version = ?, new_claim_id = ?, new_claim_version = ?,
+            preferred_claim_id = ?, preferred_claim_version = ?, status = ?, version = ?,
+            created_at = ?, updated_at = ?, encrypted_payload = ?, record_hash = ?
+          WHERE contradiction_id = ?
+        `).run(revision, ...values, sanitized.contradictionId);
+      }
+      this.database.prepare("DELETE FROM source_links WHERE owner_type = 'contradiction' AND owner_id = ?")
+        .run(sanitized.contradictionId);
+      this.linkSources("contradiction", sanitized.contradictionId, sanitized.evidenceRefs);
+      this.bumpMemoryGeneration();
+      return sanitized;
+    })();
+  }
+
+  getContradiction(contradictionId: string, scope?: ScopeRef): Contradiction | undefined {
+    const row = this.database.prepare("SELECT * FROM contradictions WHERE contradiction_id = ?")
+      .get(contradictionId) as Row | undefined;
+    if (row === undefined) return undefined;
+    if (scope !== undefined) this.assertAcl(row, scope, true);
+    return this.decodeContradiction(row);
+  }
+
+  listContradictions(
+    scope: ScopeRef,
+    options: { claimIds?: readonly string[]; includeResolved?: boolean; limit?: number } = {},
+  ): Contradiction[] {
+    const claimIds = options.claimIds ?? [];
+    const claimSql = claimIds.length === 0
+      ? ""
+      : `AND (old_claim_id IN (${claimIds.map((_, index) => `@claim${index}`).join(", ")})
+        OR new_claim_id IN (${claimIds.map((_, index) => `@claim${index}`).join(", ")}))`;
+    const rows = this.database.prepare(`
+      SELECT * FROM contradictions
+      WHERE ${this.aclSql(true)}
+        AND (@includeResolved = 1 OR status = 'unresolved')
+        ${claimSql}
+      ORDER BY updated_at DESC, contradiction_id
+      LIMIT @limit
+    `).all({
+      ...this.aclParams(scope),
+      includeResolved: options.includeResolved ? 1 : 0,
+      limit: Math.max(1, Math.min(options.limit ?? 200, 2_000)),
+      ...Object.fromEntries(claimIds.map((claimId, index) => [`claim${index}`, claimId])),
+    }) as Row[];
+    return rows.map((row) => this.decodeContradiction(row));
+  }
+
+  putMemoryTemperature(temperature: MemoryTemperature): MemoryTemperature {
+    this.requireWritable();
+    const sanitized = redactSensitiveValue(temperature).value;
+    const recordHash = sha256(canonicalJson(sanitized));
+    const existing = this.database.prepare(`
+      SELECT * FROM memory_temperatures WHERE memory_type = ? AND memory_id = ?
+    `).get(sanitized.memoryType, sanitized.memoryId) as Row | undefined;
+    if (existing !== undefined && String(existing.record_hash) === recordHash) {
+      return this.decodeMemoryTemperature(existing);
+    }
+    return this.database.transaction(() => {
+      const revision = this.nextRevision();
+      this.database.prepare(`
+        INSERT INTO memory_temperatures(
+          memory_type, memory_id, revision, user_id, workspace_id, session_id,
+          tier, score, access_count, retrieval_count, mention_count,
+          last_accessed_at, last_mentioned_at, explicit_remember, active_project,
+          pinned, updated_at, encrypted_payload, record_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(memory_type, memory_id) DO UPDATE SET
+          revision = excluded.revision, user_id = excluded.user_id,
+          workspace_id = excluded.workspace_id, session_id = excluded.session_id,
+          tier = excluded.tier, score = excluded.score, access_count = excluded.access_count,
+          retrieval_count = excluded.retrieval_count, mention_count = excluded.mention_count,
+          last_accessed_at = excluded.last_accessed_at, last_mentioned_at = excluded.last_mentioned_at,
+          explicit_remember = excluded.explicit_remember, active_project = excluded.active_project,
+          pinned = excluded.pinned, updated_at = excluded.updated_at,
+          encrypted_payload = excluded.encrypted_payload, record_hash = excluded.record_hash
+      `).run(
+        sanitized.memoryType,
+        sanitized.memoryId,
+        revision,
+        sanitized.scope.userId,
+        sanitized.scope.workspaceId ?? null,
+        sanitized.scope.sessionId ?? null,
+        sanitized.tier,
+        sanitized.score,
+        sanitized.accessCount,
+        sanitized.retrievalCount,
+        sanitized.mentionCount,
+        sanitized.lastAccessedAt ?? null,
+        sanitized.lastMentionedAt ?? null,
+        sanitized.explicitRemember ? 1 : 0,
+        sanitized.activeProject ? 1 : 0,
+        sanitized.pinned ? 1 : 0,
+        sanitized.updatedAt,
+        this.seal(
+          "memory_temperature",
+          `${sanitized.memoryType}${OWNER_ID_SEPARATOR}${sanitized.memoryId}`,
+          sanitized,
+        ),
+        recordHash,
+      );
+      return sanitized;
+    })();
+  }
+
+  getMemoryTemperature(
+    memoryType: MemoryTemperature["memoryType"],
+    memoryId: string,
+    scope?: ScopeRef,
+  ): MemoryTemperature | undefined {
+    const row = this.database.prepare(`
+      SELECT * FROM memory_temperatures WHERE memory_type = ? AND memory_id = ?
+    `).get(memoryType, memoryId) as Row | undefined;
+    if (row === undefined) return undefined;
+    if (scope !== undefined) this.assertAcl(row, scope, true);
+    return this.decodeMemoryTemperature(row);
+  }
+
+  listMemoryTemperatures(scope: ScopeRef, tier?: MemoryTemperature["tier"]): MemoryTemperature[] {
+    const rows = this.database.prepare(`
+      SELECT * FROM memory_temperatures
+      WHERE ${this.aclSql(true)} AND (@tier IS NULL OR tier = @tier)
+      ORDER BY score DESC, updated_at DESC
+    `).all({ ...this.aclParams(scope), tier: tier ?? null }) as Row[];
+    return rows.map((row) => this.decodeMemoryTemperature(row));
+  }
+
+  recordMemoryAccess(
+    memoryType: MemoryTemperature["memoryType"],
+    memoryId: string,
+    scope: ScopeRef,
+    options: { retrieved?: boolean; mentioned?: boolean; explicitRoute?: boolean; at?: string } = {},
+  ): MemoryTemperature {
+    const at = options.at ?? this.isoNow();
+    const current = this.getMemoryTemperature(memoryType, memoryId, scope);
+    const tier =
+      options.explicitRoute && (current?.tier === "cold" || current?.tier === "archive")
+        ? "warm"
+        : current?.tier ?? "warm";
+    return this.putMemoryTemperature({
+      memoryType,
+      memoryId,
+      scope,
+      tier,
+      score: options.explicitRoute ? Math.max(0.4, current?.score ?? 0) : current?.score ?? 0.4,
+      accessCount: (current?.accessCount ?? 0) + 1,
+      retrievalCount: (current?.retrievalCount ?? 0) + (options.retrieved === false ? 0 : 1),
+      mentionCount: (current?.mentionCount ?? 0) + (options.mentioned ? 1 : 0),
+      lastAccessedAt: at,
+      ...(options.mentioned ? { lastMentionedAt: at } : current?.lastMentionedAt === undefined
+        ? {}
+        : { lastMentionedAt: current.lastMentionedAt }),
+      explicitRemember: current?.explicitRemember ?? false,
+      activeProject: current?.activeProject ?? false,
+      pinned: current?.pinned ?? false,
+      updatedAt: at,
+    });
+  }
+
+  putRetrievalTrace(trace: RetrievalTrace): RetrievalTrace {
+    this.requireWritable();
+    const sanitized = redactSensitiveValue(trace).value;
+    const turn = this.getTurn(sanitized.turnId, sanitized.scope);
+    if (turn === undefined) this.notFound(`Turn ${sanitized.turnId} was not found`);
+    const refs = this.sourceRefsInValue(sanitized);
+    if (refs.length > 0) this.assertSourceRefs(refs, turn.scope);
+    return this.putAuxiliary(
+      "retrieval_trace",
+      "retrieval_traces",
+      "retrieval_id",
+      sanitized.retrievalId,
+      sanitized,
+      [
+        "turn_id",
+        "user_id",
+        "workspace_id",
+        "session_id",
+        "evidence_coverage",
+        "should_abstain",
+        "created_at",
+      ],
+      [
+        sanitized.turnId,
+        sanitized.scope.userId,
+        sanitized.scope.workspaceId ?? null,
+        sanitized.scope.sessionId ?? null,
+        sanitized.evidenceCoverage,
+        sanitized.shouldAbstain ? 1 : 0,
+        sanitized.createdAt,
+      ],
+    );
+  }
+
+  listRetrievalTraces(turnId: string): RetrievalTrace[] {
+    const rows = this.database.prepare(`
+      SELECT * FROM retrieval_traces WHERE turn_id = ? ORDER BY created_at, retrieval_id
+    `).all(turnId) as Row[];
+    return rows.map((row) =>
+      this.open<RetrievalTrace>("retrieval_trace", String(row.retrieval_id), String(row.encrypted_payload)));
+  }
+
+  /** Bounded history used by the offline Curator to derive routing-quality proxies. */
+  listRetrievalTracesForScope(scope: ScopeRef, limit = 1_000): RetrievalTrace[] {
+    const rows = this.database.prepare(`
+      SELECT * FROM retrieval_traces
+      WHERE ${this.aclSql(false)}
+      ORDER BY created_at DESC, retrieval_id
+      LIMIT @limit
+    `).all({
+      ...this.aclParams(scope),
+      limit: Math.max(1, Math.min(limit, 10_000)),
+    }) as Row[];
+    return rows.map((row) =>
+      this.open<RetrievalTrace>("retrieval_trace", String(row.retrieval_id), String(row.encrypted_payload)));
+  }
+
+  putMemoryQualityMetrics(metrics: MemoryQualityMetrics): MemoryQualityMetrics {
+    const metricId = sha256(canonicalJson([
+      metrics.ownerType,
+      metrics.ownerId,
+      metrics.scope,
+      metrics.measuredAt,
+    ]));
+    return this.putAuxiliary(
+      "memory_quality",
+      "memory_quality_metrics",
+      "metric_id",
+      metricId,
+      metrics,
+      ["owner_type", "owner_id", "user_id", "workspace_id", "session_id", "measured_at"],
+      [
+        metrics.ownerType,
+        metrics.ownerId,
+        metrics.scope.userId,
+        metrics.scope.workspaceId ?? null,
+        metrics.scope.sessionId ?? null,
+        metrics.measuredAt,
+      ],
+    );
+  }
+
+  listMemoryQualityMetrics(
+    scope: ScopeRef,
+    owner?: { type: MemoryQualityMetrics["ownerType"]; id: string },
+    limit = 500,
+  ): MemoryQualityMetrics[] {
+    const rows = this.database.prepare(`
+      SELECT * FROM memory_quality_metrics
+      WHERE ${this.aclSql(true)}
+        AND (@ownerType IS NULL OR (owner_type = @ownerType AND owner_id = @ownerId))
+      ORDER BY measured_at DESC, metric_id
+      LIMIT @limit
+    `).all({
+      ...this.aclParams(scope),
+      ownerType: owner?.type ?? null,
+      ownerId: owner?.id ?? null,
+      limit: Math.max(1, Math.min(limit, 5_000)),
+    }) as Row[];
+    return rows.map((row) =>
+      this.open<MemoryQualityMetrics>("memory_quality", String(row.metric_id), String(row.encrypted_payload)));
+  }
+
+  enqueueMaintenanceJob(
+    type: MaintenanceJobType,
+    scope: ScopeRef,
+    payload: Record<string, unknown>,
+    idempotencyKey: string,
+    dryRun = false,
+  ): MaintenanceJob {
+    this.requireWritable();
+    const jobId = `maintenance_${sha256(idempotencyKey).slice(0, 32)}`;
+    const sanitizedPayload = redactSensitiveValue(payload).value;
+    const requestHash = sha256(canonicalJson({ type, scope, payload: sanitizedPayload, idempotencyKey, dryRun }));
+    const existingRow = this.database.prepare("SELECT * FROM maintenance_jobs WHERE job_id = ?")
+      .get(jobId) as Row | undefined;
+    if (existingRow !== undefined) {
+      if (String(existingRow.record_hash) !== requestHash) {
+        this.versionConflict(`Maintenance idempotency key ${idempotencyKey} was reused`);
+      }
+      return this.decodeMaintenanceJob(existingRow);
+    }
+    this.assertNotTombstoned("maintenance_job", jobId);
+    return this.database.transaction(() => {
+      const revision = this.nextRevision();
+      const now = this.isoNow();
+      const job: MaintenanceJob = {
+        jobId,
+        scope,
+        type,
+        status: "pending",
+        dryRun,
+        idempotencyKey,
+        attempts: 0,
+        payload: sanitizedPayload,
+        availableAt: now,
+        createdAt: now,
+        updatedAt: now,
+      };
+      this.database.prepare(`
+        INSERT INTO maintenance_jobs(
+          job_id, revision, idempotency_key, user_id, workspace_id, session_id,
+          job_type, status, dry_run, attempts, cursor, available_at, leased_at,
+          completed_at, last_error, created_at, updated_at, encrypted_payload, record_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?)
+      `).run(
+        jobId,
+        revision,
+        idempotencyKey,
+        scope.userId,
+        scope.workspaceId ?? null,
+        scope.sessionId ?? null,
+        type,
+        dryRun ? 1 : 0,
+        now,
+        now,
+        now,
+        this.seal("maintenance_job", jobId, job),
+        requestHash,
+      );
+      this.putMaintenanceAudit({
+        auditId: randomUUID(),
+        revision: 0,
+        scope,
+        jobId,
+        event: "job_enqueued",
+        details: { type, dryRun },
+        createdAt: now,
+      });
+      return job;
+    })();
+  }
+
+  getMaintenanceJob(jobId: string, scope?: ScopeRef): MaintenanceJob | undefined {
+    const row = this.database.prepare("SELECT * FROM maintenance_jobs WHERE job_id = ?")
+      .get(jobId) as Row | undefined;
+    if (row === undefined) return undefined;
+    if (scope !== undefined) this.assertAcl(row, scope, true);
+    return this.decodeMaintenanceJob(row);
+  }
+
+  listMaintenanceJobs(
+    scope?: ScopeRef,
+    status?: MaintenanceJobStatus,
+    limit = 500,
+  ): MaintenanceJob[] {
+    const rows = scope === undefined
+      ? this.database.prepare(`
+          SELECT * FROM maintenance_jobs
+          WHERE (? IS NULL OR status = ?)
+          ORDER BY revision DESC LIMIT ?
+        `).all(status ?? null, status ?? null, Math.max(1, Math.min(limit, 5_000))) as Row[]
+      : this.database.prepare(`
+          SELECT * FROM maintenance_jobs
+          WHERE ${this.aclSql(true)} AND (@status IS NULL OR status = @status)
+          ORDER BY revision DESC LIMIT @limit
+        `).all({
+          ...this.aclParams(scope),
+          status: status ?? null,
+          limit: Math.max(1, Math.min(limit, 5_000)),
+        }) as Row[];
+    return rows.map((row) => this.decodeMaintenanceJob(row));
+  }
+
+  claimMaintenanceJobs(
+    limit = 25,
+    options: { now?: string; leaseMs?: number; maxAttempts?: number } = {},
+  ): MaintenanceJob[] {
+    this.requireWritable();
+    const now = options.now ?? this.isoNow();
+    const leaseMs = Math.max(1_000, options.leaseMs ?? 60_000);
+    const maxAttempts = Math.max(1, options.maxAttempts ?? 5);
+    const staleBefore = new Date(Date.parse(now) - leaseMs).toISOString();
+    return this.database.transaction(() => {
+      this.database.prepare(`
+        UPDATE maintenance_jobs SET status = 'pending', leased_at = NULL, updated_at = ?
+        WHERE status = 'running' AND leased_at < ? AND attempts < ?
+      `).run(now, staleBefore, maxAttempts);
+      this.database.prepare(`
+        UPDATE maintenance_jobs SET status = 'failed', leased_at = NULL,
+          last_error = COALESCE(last_error, 'maximum attempts exceeded'), updated_at = ?
+        WHERE status IN ('pending', 'running') AND attempts >= ?
+      `).run(now, maxAttempts);
+      const rows = this.database.prepare(`
+        SELECT * FROM maintenance_jobs
+        WHERE status = 'pending' AND available_at <= ? AND attempts < ?
+        ORDER BY revision, job_id LIMIT ?
+      `).all(now, maxAttempts, Math.max(1, Math.min(limit, 100))) as Row[];
+      const claimed: MaintenanceJob[] = [];
+      for (const row of rows) {
+        const job = this.decodeMaintenanceJob(row);
+        const revision = this.nextRevision();
+        const updated: MaintenanceJob = {
+          ...job,
+          status: "running",
+          attempts: job.attempts + 1,
+          leasedAt: now,
+          updatedAt: now,
+        };
+        this.database.prepare(`
+          UPDATE maintenance_jobs SET revision = ?, status = 'running', attempts = ?,
+            leased_at = ?, updated_at = ?, encrypted_payload = ? WHERE job_id = ?
+        `).run(
+          revision,
+          updated.attempts,
+          now,
+          now,
+          this.seal("maintenance_job", job.jobId, updated),
+          job.jobId,
+        );
+        claimed.push(updated);
+      }
+      return claimed;
+    })();
+  }
+
+  completeMaintenanceJob(jobId: string, cursor?: string): MaintenanceJob {
+    return this.updateMaintenanceJobState(jobId, "completed", {
+      ...(cursor === undefined ? {} : { cursor }),
+      completedAt: this.isoNow(),
+    });
+  }
+
+  failMaintenanceJob(
+    jobId: string,
+    error: string,
+    options: { now?: string; maxAttempts?: number } = {},
+  ): MaintenanceJob {
+    const job = this.getMaintenanceJob(jobId);
+    if (job === undefined) this.notFound(`Maintenance job ${jobId} was not found`);
+    const now = options.now ?? this.isoNow();
+    const maxAttempts = Math.max(1, options.maxAttempts ?? 5);
+    const terminal = job.attempts >= maxAttempts;
+    const availableAt = new Date(
+      Date.parse(now) + Math.min(300_000, 1_000 * (2 ** Math.max(0, job.attempts - 1))),
+    ).toISOString();
+    return this.updateMaintenanceJobState(jobId, terminal ? "failed" : "pending", {
+      availableAt,
+      lastError: redactSensitiveContent(error).value.slice(0, 500),
+    });
+  }
+
+  putMaintenanceAction(action: MaintenanceAction): MaintenanceAction {
+    this.requireWritable();
+    const sanitized = redactSensitiveValue(action).value;
+    const recordHash = sha256(canonicalJson(sanitized));
+    const existingRow = this.database.prepare("SELECT * FROM maintenance_actions WHERE action_id = ?")
+      .get(sanitized.actionId) as Row | undefined;
+    if (existingRow !== undefined) {
+      const existing = this.decodeMaintenanceAction(existingRow);
+      if (String(existingRow.record_hash) !== recordHash) {
+        this.versionConflict(`Maintenance action ${sanitized.actionId} already exists with different content`);
+      }
+      return existing;
+    }
+    const job = this.getMaintenanceJob(sanitized.jobId);
+    if (job === undefined) this.notFound(`Maintenance job ${sanitized.jobId} was not found`);
+    this.assertNotTombstoned("maintenance_action", sanitized.actionId);
+    return this.database.transaction(() => {
+      const revision = this.nextRevision();
+      this.database.prepare(`
+        INSERT INTO maintenance_actions(
+          action_id, revision, job_id, sequence, action_type, target_type,
+          target_id, status, reversible, created_at, applied_at, rolled_back_at,
+          encrypted_payload, record_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        sanitized.actionId,
+        revision,
+        sanitized.jobId,
+        sanitized.sequence,
+        sanitized.type,
+        sanitized.targetType,
+        sanitized.targetId,
+        sanitized.status,
+        sanitized.reversible ? 1 : 0,
+        sanitized.createdAt,
+        sanitized.appliedAt ?? null,
+        sanitized.rolledBackAt ?? null,
+        this.seal("maintenance_action", sanitized.actionId, sanitized),
+        recordHash,
+      );
+      return sanitized;
+    })();
+  }
+
+  updateMaintenanceAction(action: MaintenanceAction): MaintenanceAction {
+    this.requireWritable();
+    const current = this.getMaintenanceAction(action.actionId);
+    if (current === undefined) this.notFound(`Maintenance action ${action.actionId} was not found`);
+    const sanitized = redactSensitiveValue(action).value;
+    return this.database.transaction(() => {
+      const revision = this.nextRevision();
+      const recordHash = sha256(canonicalJson(sanitized));
+      this.database.prepare(`
+        UPDATE maintenance_actions SET revision = ?, status = ?, reversible = ?,
+          applied_at = ?, rolled_back_at = ?, encrypted_payload = ?, record_hash = ?
+        WHERE action_id = ?
+      `).run(
+        revision,
+        sanitized.status,
+        sanitized.reversible ? 1 : 0,
+        sanitized.appliedAt ?? null,
+        sanitized.rolledBackAt ?? null,
+        this.seal("maintenance_action", sanitized.actionId, sanitized),
+        recordHash,
+        sanitized.actionId,
+      );
+      return sanitized;
+    })();
+  }
+
+  getMaintenanceAction(actionId: string): MaintenanceAction | undefined {
+    const row = this.database.prepare("SELECT * FROM maintenance_actions WHERE action_id = ?")
+      .get(actionId) as Row | undefined;
+    return row === undefined ? undefined : this.decodeMaintenanceAction(row);
+  }
+
+  listMaintenanceActions(jobId: string): MaintenanceAction[] {
+    const rows = this.database.prepare(`
+      SELECT * FROM maintenance_actions WHERE job_id = ? ORDER BY sequence, action_id
+    `).all(jobId) as Row[];
+    return rows.map((row) => this.decodeMaintenanceAction(row));
+  }
+
+  putMaintenanceAudit(record: MaintenanceAuditRecord): MaintenanceAuditRecord {
+    this.requireWritable();
+    const auditId = record.auditId || randomUUID();
+    const sanitized = redactSensitiveValue({ ...record, auditId }).value;
+    return this.putAuxiliary(
+      "memory_audit",
+      "memory_audit_log",
+      "audit_id",
+      auditId,
+      sanitized,
+      ["user_id", "workspace_id", "session_id", "job_id", "action_id", "event", "created_at"],
+      [
+        sanitized.scope.userId,
+        sanitized.scope.workspaceId ?? null,
+        sanitized.scope.sessionId ?? null,
+        sanitized.jobId ?? null,
+        sanitized.actionId ?? null,
+        sanitized.event,
+        sanitized.createdAt,
+      ],
+    );
+  }
+
+  listMaintenanceAudit(scope: ScopeRef, limit = 500): MaintenanceAuditRecord[] {
+    const rows = this.database.prepare(`
+      SELECT * FROM memory_audit_log WHERE ${this.aclSql(true)}
+      ORDER BY created_at DESC, audit_id LIMIT @limit
+    `).all({ ...this.aclParams(scope), limit: Math.max(1, Math.min(limit, 5_000)) }) as Row[];
+    return rows.map((row) => {
+      const record = this.open<MaintenanceAuditRecord>(
+        "memory_audit",
+        String(row.audit_id),
+        String(row.encrypted_payload),
+      );
+      return { ...record, revision: Number(row.revision) };
+    });
+  }
+
   getOwnerMetadata(
     kind: SearchKind,
     id: string,
@@ -1643,10 +3017,12 @@ export class MemoryStore {
               return this.database.prepare("SELECT * FROM policies WHERE policy_id = ? AND version = ?")
                 .get(policyId, version) as Row | undefined;
             })()
-          : this.database.prepare("SELECT * FROM episodes WHERE episode_id = ?").get(id) as Row | undefined;
+          : kind === "episode"
+            ? this.database.prepare("SELECT * FROM episodes WHERE episode_id = ?").get(id) as Row | undefined
+            : this.database.prepare("SELECT * FROM memory_objects WHERE object_id = ?").get(id) as Row | undefined;
     if (row === undefined || Number(row.revision) > Math.min(maxRevision, this.getRevision())) return undefined;
     try {
-      this.assertAcl(row, scope, kind === "world_claim" || kind === "policy");
+      this.assertAcl(row, scope, kind === "world_claim" || kind === "policy" || kind === "memory_object");
     } catch (error) {
       if (error instanceof ProtocolError && error.shape.code === "SCOPE_DENIED") return undefined;
       throw error;
@@ -1655,6 +3031,8 @@ export class MemoryStore {
       ? String(row.occurred_at)
       : kind === "episode"
         ? String(row.ended_at)
+        : kind === "memory_object"
+          ? String(row.updated_at)
         : undefined;
     return {
       kind,
@@ -1891,6 +3269,7 @@ export class MemoryStore {
         worldClaims: [],
         policies: [],
         episodes: [],
+        memoryObjects: [],
       };
     }
 
@@ -1973,12 +3352,28 @@ export class MemoryStore {
       })));
     }
 
+    if (requestedKinds.has("memory_object")) {
+      const routes = this.routeMemoryObjects(query, scope, {
+        maxRevision: revision,
+        limit,
+        candidateLimit: limit,
+        partitionLimit: Math.min(limit, 40),
+        ...(options.includeInactive === undefined ? {} : { includeArchive: options.includeInactive }),
+      });
+      rawHits.push(...routes.map((route) => ({
+        kind: "memory_object" as const,
+        id: route.object.objectId,
+        rank: -route.score,
+      })));
+    }
+
     rawHits.sort((left, right) => left.rank - right.rank || left.id.localeCompare(right.id));
     const selected = rawHits.slice(0, limit);
     const eventRefs: SourceRef[] = [];
     const worldClaims: WorldClaim[] = [];
     const policies: StoredPolicy[] = [];
     const episodes: EpisodeMemory[] = [];
+    const memoryObjects: MemoryObject[] = [];
     const hits: SearchHit[] = [];
 
     for (const hit of selected) {
@@ -2000,11 +3395,16 @@ export class MemoryStore {
         sourceRefs = policy.sources ?? [];
         this.assertSourceRefs(sourceRefs, scope);
         policies.push(policy);
-      } else {
+      } else if (hit.kind === "episode") {
         const episode = this.required(this.getEpisode(hit.id, scope), `search episode ${hit.id}`);
         this.assertSourceRefs(episode.eventRefs, scope);
         sourceRefs = episode.eventRefs;
         episodes.push(episode);
+      } else {
+        const object = this.required(this.getMemoryObject(hit.id, scope), `search memory object ${hit.id}`);
+        this.assertSourceRefs(object.evidenceRefs, scope);
+        sourceRefs = object.evidenceRefs;
+        memoryObjects.push(object);
       }
       hits.push({ kind: hit.kind, id: hit.id, score: -hit.rank, sourceRefs });
     }
@@ -2018,6 +3418,7 @@ export class MemoryStore {
       worldClaims,
       policies,
       episodes,
+      memoryObjects,
     };
   }
 
@@ -2034,6 +3435,13 @@ export class MemoryStore {
             id: this.resolveForgetEntityId(selector.entityType, this.required(selector.entityId, "entityId")),
           }]
         : this.collectScopedEntities(selector);
+      if (
+        selector.entityType === undefined &&
+        selector.sessionId !== undefined &&
+        !ids.some((entity) => entity.type === "session" && entity.id === selector.sessionId)
+      ) {
+        ids.push({ type: "session", id: selector.sessionId });
+      }
       if (ids.length === 0 && !selector.entityType) {
         return { revision: this.getRevision(), deleted: {}, tombstonesCreated: 0 };
       }
@@ -2053,6 +3461,17 @@ export class MemoryStore {
           seen,
         );
       }
+      this.database.prepare(`
+        DELETE FROM memory_scope_registry
+        WHERE NOT EXISTS (
+          SELECT 1 FROM source_events e
+          WHERE e.user_id = memory_scope_registry.user_id
+            AND (
+              (memory_scope_registry.workspace_id IS NULL AND e.workspace_id IS NULL)
+              OR e.workspace_id = memory_scope_registry.workspace_id
+            )
+        )
+      `).run();
       this.touchIndex(revision);
       return { revision, deleted, tombstonesCreated };
     })();
@@ -2084,6 +3503,32 @@ export class MemoryStore {
       this.required(this.getSession(String(row.session_id)), `session ${String(row.session_id)}`));
     const triggerActivations = rows("SELECT * FROM trigger_activations ORDER BY revision, activation_id")
       .map((row) => this.decodeTriggerActivation(row));
+    const memoryPartitions = rows("SELECT * FROM memory_partitions ORDER BY revision, partition_id")
+      .map((row) => this.decodeMemoryPartition(row));
+    const memoryObjects = rows("SELECT * FROM memory_objects ORDER BY revision, object_id")
+      .map((row) => this.decodeMemoryObject(row));
+    const memoryObjectMembers = rows(`
+      SELECT * FROM memory_object_members ORDER BY revision, object_id, member_type, member_id
+    `).map((row) => this.decodeMemoryObjectMember(row));
+    const memoryRelations = rows("SELECT * FROM memory_relations ORDER BY revision, relation_id")
+      .map((row) => this.decodeMemoryRelation(row));
+    const memoryVersions = rows("SELECT * FROM memory_versions ORDER BY revision, version_id")
+      .map((row) => this.open<MemoryVersion>(
+        "memory_version",
+        String(row.version_id),
+        String(row.encrypted_payload),
+      ));
+    const contradictions = rows("SELECT * FROM contradictions ORDER BY revision, contradiction_id")
+      .map((row) => this.decodeContradiction(row));
+    const memoryTemperatures = rows(`
+      SELECT * FROM memory_temperatures ORDER BY revision, memory_type, memory_id
+    `).map((row) => this.decodeMemoryTemperature(row));
+    const retrievalTraces = rows("SELECT * FROM retrieval_traces ORDER BY revision, retrieval_id")
+      .map((row) => this.open<RetrievalTrace>(
+        "retrieval_trace",
+        String(row.retrieval_id),
+        String(row.encrypted_payload),
+      ));
     const tombstones = rows("SELECT * FROM tombstones ORDER BY revision, entity_type, entity_id");
     const payload: ExportPackage = {
       format: "memoryd-export",
@@ -2106,6 +3551,14 @@ export class MemoryStore {
         calibrationPatterns,
         sessions,
         triggerActivations,
+        memoryPartitions,
+        memoryObjects,
+        memoryObjectMembers,
+        memoryRelations,
+        memoryVersions,
+        contradictions,
+        memoryTemperatures,
+        retrievalTraces,
         tombstones,
       },
     };
@@ -2279,6 +3732,50 @@ export class MemoryStore {
         activatedAt: activation.activatedAt,
       }));
     }
+    for (const partition of payload.records.memoryPartitions ?? []) {
+      const existed = this.getMemoryPartition(partition.partitionId) !== undefined
+        || this.hasTombstone("memory_partition", partition.partitionId);
+      run("memory_partition", partition.partitionId, existed, () => this.putMemoryPartition(partition));
+    }
+    for (const object of payload.records.memoryObjects ?? []) {
+      const existed = this.getMemoryObject(object.objectId) !== undefined
+        || this.hasTombstone("memory_object", object.objectId);
+      run("memory_object", object.objectId, existed, () => this.putMemoryObject(object));
+    }
+    for (const member of payload.records.memoryObjectMembers ?? []) {
+      const entityId = `${member.objectId}${OWNER_ID_SEPARATOR}${member.memberType}${OWNER_ID_SEPARATOR}${member.memberId}`;
+      const existed = this.database.prepare(`
+        SELECT 1 FROM memory_object_members
+        WHERE object_id = ? AND member_type = ? AND member_id = ?
+      `).get(member.objectId, member.memberType, member.memberId) !== undefined;
+      run("memory_object_member", entityId, existed, () => this.putMemoryObjectMember(member));
+    }
+    for (const relation of payload.records.memoryRelations ?? []) {
+      const existed = this.getMemoryRelation(relation.relationId) !== undefined
+        || this.hasTombstone("memory_relation", relation.relationId);
+      run("memory_relation", relation.relationId, existed, () => this.putMemoryRelation(relation));
+    }
+    for (const version of payload.records.memoryVersions ?? []) {
+      const existed = this.hasRow("memory_versions", "version_id", version.versionId)
+        || this.hasTombstone("memory_version", version.versionId);
+      run("memory_version", version.versionId, existed, () => this.putMemoryVersion(version));
+    }
+    for (const contradiction of payload.records.contradictions ?? []) {
+      const existed = this.getContradiction(contradiction.contradictionId) !== undefined
+        || this.hasTombstone("contradiction", contradiction.contradictionId);
+      run("contradiction", contradiction.contradictionId, existed, () =>
+        this.putContradiction(contradiction));
+    }
+    for (const temperature of payload.records.memoryTemperatures ?? []) {
+      const entityId = `${temperature.memoryType}${OWNER_ID_SEPARATOR}${temperature.memoryId}`;
+      const existed = this.getMemoryTemperature(temperature.memoryType, temperature.memoryId) !== undefined;
+      run("memory_temperature", entityId, existed, () => this.putMemoryTemperature(temperature));
+    }
+    for (const trace of payload.records.retrievalTraces ?? []) {
+      const existed = this.database.prepare("SELECT 1 FROM retrieval_traces WHERE retrieval_id = ?")
+        .get(trace.retrievalId) !== undefined || this.hasTombstone("retrieval_trace", trace.retrievalId);
+      run("retrieval_trace", trace.retrievalId, existed, () => this.putRetrievalTrace(trace));
+    }
 
     return { imported, skipped, conflicts, revision: this.getRevision() };
   }
@@ -2295,6 +3792,7 @@ export class MemoryStore {
         DELETE FROM world_claims_fts;
         DELETE FROM policies_fts;
         DELETE FROM episodes_fts;
+        DELETE FROM memory_objects_fts;
         DELETE FROM source_links;
         DELETE FROM embeddings;
         DELETE FROM embedding_buckets;
@@ -2305,6 +3803,10 @@ export class MemoryStore {
         world_claim: 0,
         policy: 0,
         episode: 0,
+        memory_object: 0,
+        memory_relation: 0,
+        contradiction: 0,
+        memory_version: 0,
         embedding: 0,
         entity_edge: 0,
       };
@@ -2354,6 +3856,36 @@ export class MemoryStore {
         );
         this.linkSources("episode", episode.episodeId, episode.eventRefs);
         indexed.episode = (indexed.episode ?? 0) + 1;
+      }
+      for (const row of this.database.prepare("SELECT * FROM memory_objects").all() as Row[]) {
+        const object = this.decodeMemoryObject(row);
+        // Object routing uses bounded partition-local rows rather than a
+        // rebuilt global FTS layer.
+        this.linkSources("memory_object", object.objectId, object.evidenceRefs);
+        indexed.memory_object = (indexed.memory_object ?? 0) + 1;
+      }
+      for (const row of this.database.prepare("SELECT * FROM memory_relations").all() as Row[]) {
+        const relation = this.decodeMemoryRelation(row);
+        if (relation.evidenceRefs.length > 0) {
+          this.linkSources("memory_relation", relation.relationId, relation.evidenceRefs);
+        }
+        indexed.memory_relation = (indexed.memory_relation ?? 0) + 1;
+      }
+      for (const row of this.database.prepare("SELECT * FROM contradictions").all() as Row[]) {
+        const contradiction = this.decodeContradiction(row);
+        this.linkSources("contradiction", contradiction.contradictionId, contradiction.evidenceRefs);
+        indexed.contradiction = (indexed.contradiction ?? 0) + 1;
+      }
+      for (const row of this.database.prepare("SELECT * FROM memory_versions").all() as Row[]) {
+        const version = this.open<MemoryVersion>(
+          "memory_version",
+          String(row.version_id),
+          String(row.encrypted_payload),
+        );
+        if (version.evidenceRefs.length > 0) {
+          this.linkSources("memory_version", version.versionId, version.evidenceRefs);
+        }
+        indexed.memory_version = (indexed.memory_version ?? 0) + 1;
       }
       for (const row of this.database.prepare("SELECT * FROM observations").all() as Row[]) {
         const observation = this.decodeObservation(row);
@@ -2431,6 +3963,15 @@ export class MemoryStore {
       endedSessions: count("SELECT count(*) AS count FROM session_lifecycle WHERE status = 'ended'"),
       embeddingCount: count("SELECT count(*) AS count FROM embeddings"),
       entityEdgeCount: count("SELECT count(*) AS count FROM entity_edges"),
+      memoryObjectCount: count("SELECT count(*) AS count FROM memory_objects"),
+      partitionCount: count("SELECT count(*) AS count FROM memory_partitions"),
+      pendingMaintenanceJobs: count(
+        "SELECT count(*) AS count FROM maintenance_jobs WHERE status IN ('pending', 'running')",
+      ),
+      failedMaintenanceJobs: count("SELECT count(*) AS count FROM maintenance_jobs WHERE status = 'failed'"),
+      maintenanceBacklog: count(
+        "SELECT count(*) AS count FROM maintenance_jobs WHERE status IN ('pending', 'running', 'failed')",
+      ),
       issues,
     };
   }
@@ -2470,12 +4011,194 @@ export class MemoryStore {
     this.setMetadata("index_revision", String(revision));
   }
 
+  private bumpMemoryGeneration(): number {
+    this.database.prepare(`
+      UPDATE metadata SET value = CAST(value AS INTEGER) + 1 WHERE key = 'memory_generation'
+    `).run();
+    return this.getMemoryGeneration();
+  }
+
   private seal(type: string, id: string, payload: unknown): string {
     return encryptJson(payload, this.key, `${type}:${id}`);
   }
 
   private open<T>(type: string, id: string, payload: string): T {
     return decryptJson<T>(payload, this.key, `${type}:${id}`);
+  }
+
+  private decodeMemoryPartition(row: Row): MemoryPartition {
+    const partitionId = String(row.partition_id);
+    const value = this.open<MemoryPartition>(
+      "memory_partition",
+      partitionId,
+      String(row.encrypted_payload),
+    );
+    return {
+      ...value,
+      partitionId,
+      scope: this.scopeFromRow(row),
+      namespace: String(row.namespace),
+      partitionKey: String(row.partition_key),
+      strategy: String(row.strategy) as MemoryPartition["strategy"],
+      status: String(row.status) as MemoryPartition["status"],
+      depth: Number(row.depth),
+      childCount: Number(row.child_count),
+      objectCount: Number(row.object_count),
+      capacity: Number(row.capacity),
+      version: Number(row.version),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+      ...(typeof row.parent_partition_id === "string"
+        ? { parentPartitionId: row.parent_partition_id }
+        : {}),
+    };
+  }
+
+  private decodeMemoryObject(row: Row): MemoryObject {
+    const objectId = String(row.object_id);
+    const value = this.open<MemoryObject>("memory_object", objectId, String(row.encrypted_payload));
+    return {
+      ...value,
+      objectId,
+      scope: this.scopeFromRow(row),
+      partitionId: String(row.partition_id),
+      objectType: String(row.object_type) as MemoryObject["objectType"],
+      title: String(row.title),
+      status: String(row.status) as MemoryObject["status"],
+      temperature: String(row.temperature) as MemoryObject["temperature"],
+      tokenEstimate: Number(row.token_estimate),
+      childCount: Number(row.child_count),
+      memberCount: Number(row.member_count),
+      confidence: Number(row.confidence),
+      version: Number(row.version),
+      schemaVersion: Number(row.schema_version),
+      summarizerVersion: String(row.summarizer_version),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+      ...(typeof row.parent_object_id === "string" ? { parentObjectId: row.parent_object_id } : {}),
+    };
+  }
+
+  private decodeMemoryObjectMember(row: Row): MemoryObjectMember {
+    return {
+      objectId: String(row.object_id),
+      memberType: String(row.member_type) as MemoryObjectMember["memberType"],
+      memberId: String(row.member_id),
+      role: String(row.role) as MemoryObjectMember["role"],
+      score: Number(row.score),
+      status: String(row.status) as MemoryObjectMember["status"],
+      addedAt: String(row.added_at),
+      updatedAt: String(row.updated_at),
+      ...(typeof row.origin_action_id === "string" ? { originActionId: row.origin_action_id } : {}),
+    };
+  }
+
+  private decodeMemoryRelation(row: Row): MemoryRelation {
+    const relationId = String(row.relation_id);
+    const value = this.open<MemoryRelation>("memory_relation", relationId, String(row.encrypted_payload));
+    return {
+      ...value,
+      relationId,
+      scope: this.scopeFromRow(row),
+      from: { type: String(row.from_type) as MemoryRelation["from"]["type"], id: String(row.from_id) },
+      to: { type: String(row.to_type) as MemoryRelation["to"]["type"], id: String(row.to_id) },
+      relation: String(row.relation_type) as MemoryRelation["relation"],
+      status: String(row.status) as MemoryRelation["status"],
+      confidence: Number(row.confidence),
+      version: Number(row.version),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
+  }
+
+  private decodeContradiction(row: Row): Contradiction {
+    const contradictionId = String(row.contradiction_id);
+    const value = this.open<Contradiction>(
+      "contradiction",
+      contradictionId,
+      String(row.encrypted_payload),
+    );
+    return {
+      ...value,
+      contradictionId,
+      scope: this.scopeFromRow(row),
+      status: String(row.status) as Contradiction["status"],
+      version: Number(row.version),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
+  }
+
+  private decodeMemoryTemperature(row: Row): MemoryTemperature {
+    const memoryType = String(row.memory_type) as MemoryTemperature["memoryType"];
+    const memoryId = String(row.memory_id);
+    const value = this.open<MemoryTemperature>(
+      "memory_temperature",
+      `${memoryType}${OWNER_ID_SEPARATOR}${memoryId}`,
+      String(row.encrypted_payload),
+    );
+    return {
+      ...value,
+      memoryType,
+      memoryId,
+      scope: this.scopeFromRow(row),
+      tier: String(row.tier) as MemoryTemperature["tier"],
+      score: Number(row.score),
+      accessCount: Number(row.access_count),
+      retrievalCount: Number(row.retrieval_count),
+      mentionCount: Number(row.mention_count),
+      explicitRemember: Number(row.explicit_remember) === 1,
+      activeProject: Number(row.active_project) === 1,
+      pinned: Number(row.pinned) === 1,
+      updatedAt: String(row.updated_at),
+      ...(typeof row.last_accessed_at === "string" ? { lastAccessedAt: row.last_accessed_at } : {}),
+      ...(typeof row.last_mentioned_at === "string" ? { lastMentionedAt: row.last_mentioned_at } : {}),
+    };
+  }
+
+  private decodeMaintenanceJob(row: Row): MaintenanceJob {
+    const jobId = String(row.job_id);
+    const value = this.open<MaintenanceJob>("maintenance_job", jobId, String(row.encrypted_payload));
+    return {
+      ...value,
+      jobId,
+      scope: this.scopeFromRow(row),
+      type: String(row.job_type) as MaintenanceJobType,
+      status: String(row.status) as MaintenanceJobStatus,
+      dryRun: Number(row.dry_run) === 1,
+      idempotencyKey: String(row.idempotency_key),
+      attempts: Number(row.attempts),
+      availableAt: String(row.available_at),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+      ...(typeof row.cursor === "string" ? { cursor: row.cursor } : {}),
+      ...(typeof row.leased_at === "string" ? { leasedAt: row.leased_at } : {}),
+      ...(typeof row.completed_at === "string" ? { completedAt: row.completed_at } : {}),
+      ...(typeof row.last_error === "string" ? { lastError: row.last_error } : {}),
+    };
+  }
+
+  private decodeMaintenanceAction(row: Row): MaintenanceAction {
+    const actionId = String(row.action_id);
+    const value = this.open<MaintenanceAction>(
+      "maintenance_action",
+      actionId,
+      String(row.encrypted_payload),
+    );
+    return {
+      ...value,
+      actionId,
+      jobId: String(row.job_id),
+      sequence: Number(row.sequence),
+      type: String(row.action_type) as MaintenanceAction["type"],
+      targetType: String(row.target_type) as MaintenanceAction["targetType"],
+      targetId: String(row.target_id),
+      status: String(row.status) as MaintenanceAction["status"],
+      reversible: Number(row.reversible) === 1,
+      createdAt: String(row.created_at),
+      ...(typeof row.applied_at === "string" ? { appliedAt: row.applied_at } : {}),
+      ...(typeof row.rolled_back_at === "string" ? { rolledBackAt: row.rolled_back_at } : {}),
+    };
   }
 
   private decodeSourceEvent(row: Row): SourceEvent {
@@ -2502,7 +4225,7 @@ export class MemoryStore {
     );
     const plan: TurnPlan = persistedPlan.protocolVersion === PROTOCOL_VERSION
       ? persistedPlan as TurnPlan
-      : persistedPlan.protocolVersion === "1.0"
+      : persistedPlan.protocolVersion === "1.0" || persistedPlan.protocolVersion === "1.1"
         ? { ...persistedPlan, protocolVersion: PROTOCOL_VERSION }
         : (() => {
             throw new ProtocolError({
@@ -2702,6 +4425,20 @@ export class MemoryStore {
       INSERT OR IGNORE INTO source_links(owner_type, owner_id, event_id) VALUES (?, ?, ?)
     `);
     for (const ref of refs) statement.run(ownerType, ownerId, ref.eventId);
+  }
+
+  private touchMemoryScope(scope: ScopeRef, at: string): void {
+    this.database.prepare(`
+      INSERT INTO memory_scope_registry(user_id, workspace_key, workspace_id, last_activity_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(user_id, workspace_key) DO UPDATE SET
+        workspace_id = excluded.workspace_id,
+        last_activity_at = CASE
+          WHEN excluded.last_activity_at > memory_scope_registry.last_activity_at
+          THEN excluded.last_activity_at
+          ELSE memory_scope_registry.last_activity_at
+        END
+    `).run(scope.userId, scope.workspaceId ?? "", scope.workspaceId ?? null, at);
   }
 
   private aclSql(sessionScoped: boolean, alias?: string): string {
@@ -2930,6 +4667,59 @@ export class MemoryStore {
     })();
   }
 
+  private updateMaintenanceJobState(
+    jobId: string,
+    status: MaintenanceJobStatus,
+    patch: Partial<Pick<
+      MaintenanceJob,
+      "availableAt" | "lastError" | "cursor" | "completedAt"
+    >> = {},
+  ): MaintenanceJob {
+    this.requireWritable();
+    const job = this.getMaintenanceJob(jobId);
+    if (job === undefined) this.notFound(`Maintenance job ${jobId} was not found`);
+    return this.database.transaction(() => {
+      const revision = this.nextRevision();
+      const now = this.isoNow();
+      const updated: MaintenanceJob = {
+        ...job,
+        ...patch,
+        status,
+        updatedAt: now,
+      };
+      if (status !== "running") delete updated.leasedAt;
+      this.database.prepare(`
+        UPDATE maintenance_jobs SET revision = ?, status = ?, cursor = ?,
+          available_at = ?, leased_at = ?, completed_at = ?, last_error = ?,
+          updated_at = ?, encrypted_payload = ? WHERE job_id = ?
+      `).run(
+        revision,
+        status,
+        updated.cursor ?? null,
+        updated.availableAt,
+        updated.leasedAt ?? null,
+        updated.completedAt ?? null,
+        updated.lastError ?? null,
+        now,
+        this.seal("maintenance_job", jobId, updated),
+        jobId,
+      );
+      this.putMaintenanceAudit({
+        auditId: randomUUID(),
+        revision: 0,
+        scope: updated.scope,
+        jobId,
+        event: `job_${status}`,
+        details: {
+          attempts: updated.attempts,
+          ...(updated.lastError === undefined ? {} : { lastError: updated.lastError }),
+        },
+        createdAt: now,
+      });
+      return updated;
+    })();
+  }
+
   private updateLearningJobState(
     jobId: string,
     status: LearningJobRecord["status"],
@@ -2983,15 +4773,28 @@ export class MemoryStore {
       ...collect("world_claims", `claim_id || '${OWNER_ID_SEPARATOR}' || version`, "world_claim"),
       ...collect("policies", `policy_id || '${OWNER_ID_SEPARATOR}' || version`, "policy"),
       ...collect("episodes", "episode_id", "episode"),
+      ...collect("memory_objects", "object_id", "memory_object"),
+      ...collect("memory_relations", "relation_id", "memory_relation"),
+      ...collect("contradictions", "contradiction_id", "contradiction"),
       ...collect("observations", "observation_id", "observation"),
       ...collect("corrections", "correction_id", "correction"),
       ...collect("turn_traces", "trace_id", "trace"),
+      ...collect("retrieval_traces", "retrieval_id", "retrieval_trace"),
       ...collect("triggers", "trigger_id", "trigger"),
       ...(selector.sessionId === undefined
         ? collect("failure_clusters", "cluster_id", "failure_cluster", false)
         : []),
       ...collect("source_events", "event_id", "source_event"),
       ...collect("turns", "turn_id", "turn"),
+      ...collect("maintenance_jobs", "job_id", "maintenance_job"),
+      ...collect("memory_audit_log", "audit_id", "memory_audit"),
+      ...collect("memory_quality_metrics", "metric_id", "memory_quality"),
+      ...collect(
+        "memory_temperatures",
+        `memory_type || '${OWNER_ID_SEPARATOR}' || memory_id`,
+        "memory_temperature",
+      ),
+      ...collect("memory_partitions", "partition_id", "memory_partition"),
       ...collect("session_lifecycle", "session_id", "session"),
     ];
   }
@@ -3052,12 +4855,22 @@ export class MemoryStore {
     }
     if (
       row &&
-      ["world_claim", "policy", "episode", "correction", "observation"].includes(entityType)
+      [
+        "world_claim",
+        "policy",
+        "episode",
+        "correction",
+        "observation",
+        "memory_object",
+        "memory_relation",
+        "memory_version",
+        "contradiction",
+      ].includes(entityType)
     ) {
       const linkedEvents = this.database
         .prepare("SELECT event_id FROM source_links WHERE owner_type = ? AND owner_id = ?")
         .all(entityType, entityId) as Row[];
-      const cascadeSelector: ForgetSelector = { userId: String(row.user_id) };
+      const cascadeSelector: ForgetSelector = { userId: selector.userId };
       if (selector.reason !== undefined) cascadeSelector.reason = selector.reason;
       for (const linked of linkedEvents) {
         tombstonesCreated += this.deleteEntity(
@@ -3098,6 +4911,7 @@ export class MemoryStore {
         ["observations", "observation_id", "observation"],
         ["corrections", "correction_id", "correction"],
         ["turn_traces", "trace_id", "trace"],
+        ["retrieval_traces", "retrieval_id", "retrieval_trace"],
       ] as const) {
         const children = this.database.prepare(`SELECT ${idColumn} AS id FROM ${table} WHERE turn_id = ?`).all(entityId) as Row[];
         for (const child of children) {
@@ -3219,6 +5033,106 @@ export class MemoryStore {
     if (row && entityType === "trigger") {
       this.database.prepare("DELETE FROM trigger_activations WHERE trigger_id = ?").run(entityId);
     }
+    if (row && entityType === "world_claim") {
+      const [claimId] = this.parseVersionedId(entityId);
+      const contradictions = this.database.prepare(`
+        SELECT contradiction_id AS id FROM contradictions
+        WHERE old_claim_id = ? OR new_claim_id = ?
+      `).all(claimId, claimId) as Row[];
+      for (const contradiction of contradictions) {
+        tombstonesCreated += this.deleteEntity(
+          "contradiction",
+          String(contradiction.id),
+          selector,
+          revision,
+          deletedAt,
+          deleted,
+          seen,
+        );
+      }
+    }
+    if (row && entityType === "memory_object") {
+      const relations = this.database.prepare(`
+        SELECT relation_id AS id FROM memory_relations
+        WHERE (from_type = 'object' AND from_id = ?)
+           OR (to_type = 'object' AND to_id = ?)
+      `).all(entityId, entityId) as Row[];
+      for (const relation of relations) {
+        tombstonesCreated += this.deleteEntity(
+          "memory_relation",
+          String(relation.id),
+          selector,
+          revision,
+          deletedAt,
+          deleted,
+          seen,
+        );
+      }
+      const versions = this.database.prepare(`
+        SELECT version_id AS id FROM memory_versions
+        WHERE memory_type = 'object' AND memory_id = ?
+      `).all(entityId) as Row[];
+      for (const version of versions) {
+        tombstonesCreated += this.deleteEntity(
+          "memory_version",
+          String(version.id),
+          selector,
+          revision,
+          deletedAt,
+          deleted,
+          seen,
+        );
+      }
+      const memberDelete = this.database.prepare(`
+        DELETE FROM memory_object_members WHERE object_id = ?
+          OR (member_type = 'object' AND member_id = ?)
+      `).run(entityId, entityId);
+      if (memberDelete.changes > 0) {
+        deleted.memory_object_member = (deleted.memory_object_member ?? 0) + memberDelete.changes;
+      }
+      this.database.prepare(`
+        DELETE FROM memory_temperatures WHERE memory_type = 'object' AND memory_id = ?
+      `).run(entityId);
+      this.database.prepare(`
+        DELETE FROM memory_quality_metrics WHERE owner_type = 'object' AND owner_id = ?
+      `).run(entityId);
+    }
+    if (row && entityType === "memory_partition") {
+      const objects = this.database.prepare(`
+        SELECT object_id AS id FROM memory_objects WHERE partition_id = ?
+      `).all(entityId) as Row[];
+      for (const object of objects) {
+        tombstonesCreated += this.deleteEntity(
+          "memory_object",
+          String(object.id),
+          selector,
+          revision,
+          deletedAt,
+          deleted,
+          seen,
+        );
+      }
+    }
+    if (row && entityType === "maintenance_job") {
+      const actions = this.database.prepare(`
+        SELECT action_id AS id FROM maintenance_actions WHERE job_id = ?
+      `).all(entityId) as Row[];
+      for (const action of actions) {
+        tombstonesCreated += this.deleteEntity(
+          "maintenance_action",
+          String(action.id),
+          selector,
+          revision,
+          deletedAt,
+          deleted,
+          seen,
+        );
+      }
+      const auditDelete = this.database.prepare("DELETE FROM memory_audit_log WHERE job_id = ?").run(entityId);
+      if (auditDelete.changes > 0) {
+        deleted.memory_audit = (deleted.memory_audit ?? 0) + auditDelete.changes;
+      }
+    }
     if (row && "user_id" in row) {
       const rowScope: ScopeRef = { userId: String(row.user_id) };
       if (typeof row.workspace_id === "string") rowScope.workspaceId = row.workspace_id;
@@ -3246,6 +5160,8 @@ export class MemoryStore {
         this.database.prepare("DELETE FROM policies_fts WHERE row_key = ?").run(entityId);
       } else if (entityType === "episode") {
         this.database.prepare("DELETE FROM episodes_fts WHERE episode_id = ?").run(entityId);
+      } else if (entityType === "memory_object") {
+        this.database.prepare("DELETE FROM memory_objects_fts WHERE object_id = ?").run(entityId);
       }
       this.database.prepare("DELETE FROM source_links WHERE owner_type = ? AND owner_id = ?").run(entityType, entityId);
       this.database.prepare("DELETE FROM embeddings WHERE owner_type = ? AND owner_id = ?").run(entityType, entityId);
@@ -3296,6 +5212,25 @@ export class MemoryStore {
         return { table: "policies", where: "policy_id = ? AND version = ?", args: [id, version] };
       }
       case "episode": return { table: "episodes", where: "episode_id = ?", args: [entityId] };
+      case "memory_object": return { table: "memory_objects", where: "object_id = ?", args: [entityId] };
+      case "memory_partition": return { table: "memory_partitions", where: "partition_id = ?", args: [entityId] };
+      case "memory_relation": return { table: "memory_relations", where: "relation_id = ?", args: [entityId] };
+      case "memory_version": return { table: "memory_versions", where: "version_id = ?", args: [entityId] };
+      case "contradiction": return { table: "contradictions", where: "contradiction_id = ?", args: [entityId] };
+      case "retrieval_trace": return { table: "retrieval_traces", where: "retrieval_id = ?", args: [entityId] };
+      case "maintenance_job": return { table: "maintenance_jobs", where: "job_id = ?", args: [entityId] };
+      case "maintenance_action": return { table: "maintenance_actions", where: "action_id = ?", args: [entityId] };
+      case "memory_audit": return { table: "memory_audit_log", where: "audit_id = ?", args: [entityId] };
+      case "memory_quality": return { table: "memory_quality_metrics", where: "metric_id = ?", args: [entityId] };
+      case "memory_temperature": {
+        const separator = entityId.indexOf(OWNER_ID_SEPARATOR);
+        if (separator < 1) throw new TypeError(`Invalid memory temperature ID ${entityId}`);
+        return {
+          table: "memory_temperatures",
+          where: "memory_type = ? AND memory_id = ?",
+          args: [entityId.slice(0, separator), entityId.slice(separator + 1)],
+        };
+      }
       case "correction": return { table: "corrections", where: "correction_id = ?", args: [entityId] };
       case "trace": return { table: "turn_traces", where: "trace_id = ?", args: [entityId] };
       case "trigger": return { table: "triggers", where: "trigger_id = ?", args: [entityId] };
@@ -3365,6 +5300,7 @@ export class MemoryStore {
       return existing;
     }
     this.assertNotTombstoned("source_event", event.eventId);
+    this.assertNotTombstoned("session", event.scope.sessionId);
     const sameKey = this.database
       .prepare("SELECT event_id FROM source_events WHERE idempotency_key = ?")
       .get(record.idempotencyKey) as Row | undefined;
@@ -3400,6 +5336,7 @@ export class MemoryStore {
       this.database.prepare(`
         INSERT INTO source_events_fts(event_id, user_id, workspace_id, content) VALUES (?, ?, ?, ?)
       `).run(event.eventId, event.scope.userId, event.scope.workspaceId ?? null, event.content);
+      this.touchMemoryScope(imported.scope, imported.capturedAt);
       this.touchIndex(revision);
       return imported;
     })();
@@ -3473,6 +5410,24 @@ export class MemoryStore {
     for (const record of payload.records.failureClusters ?? []) addScope(record.scope);
     for (const record of payload.records.sessions ?? []) addScope(record.scope);
     for (const record of payload.records.triggerActivations ?? []) addScope(record.scope);
+    for (const record of payload.records.memoryPartitions ?? []) addScope(record.scope);
+    for (const record of payload.records.memoryObjects ?? []) {
+      addScope(record.scope);
+      validateArtifactSources(`MemoryObject ${record.objectId}`, record.evidenceRefs, true);
+    }
+    for (const record of payload.records.memoryRelations ?? []) {
+      addScope(record.scope);
+      validateArtifactSources(`MemoryRelation ${record.relationId}`, record.evidenceRefs, false);
+    }
+    for (const record of payload.records.memoryVersions ?? []) {
+      validateArtifactSources(`MemoryVersion ${record.versionId}`, record.evidenceRefs, false);
+    }
+    for (const record of payload.records.contradictions ?? []) {
+      addScope(record.scope);
+      validateArtifactSources(`Contradiction ${record.contradictionId}`, record.evidenceRefs, true);
+    }
+    for (const record of payload.records.memoryTemperatures ?? []) addScope(record.scope);
+    for (const record of payload.records.retrievalTraces ?? []) addScope(record.scope);
     for (const record of payload.records.calibrationPatterns ?? []) {
       validateArtifactSources(`Calibration ${record.patternId}`, record.sourceRefs ?? [], true);
     }
@@ -3497,6 +5452,15 @@ export class MemoryStore {
         UNION ALL SELECT user_id FROM failure_clusters
         UNION ALL SELECT user_id FROM session_lifecycle
         UNION ALL SELECT user_id FROM trigger_activations
+        UNION ALL SELECT user_id FROM memory_partitions
+        UNION ALL SELECT user_id FROM memory_objects
+        UNION ALL SELECT user_id FROM memory_relations
+        UNION ALL SELECT user_id FROM contradictions
+        UNION ALL SELECT user_id FROM memory_temperatures
+        UNION ALL SELECT user_id FROM retrieval_traces
+        UNION ALL SELECT user_id FROM maintenance_jobs
+        UNION ALL SELECT user_id FROM memory_audit_log
+        UNION ALL SELECT user_id FROM memory_quality_metrics
         UNION ALL SELECT user_id FROM tombstones
       ) LIMIT 2
     `).all() as Row[];

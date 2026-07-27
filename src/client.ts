@@ -9,8 +9,10 @@ import type {
   EndSessionInput,
   EndSessionResult,
   MemoryBundle,
+  MemoryRetrievalResult,
   RecallInput,
   RecordEventInput,
+  RetrieveMemoryInput,
   SourceEvent,
   SourceRef,
   TurnPlan,
@@ -77,6 +79,13 @@ export class MemoryClient {
 
   recall(input: RecallInput): Promise<MemoryBundle> {
     return this.request(`/v1/turns/${encodeURIComponent(input.turnId)}/recall`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  retrieveMemory(input: RetrieveMemoryInput): Promise<MemoryRetrievalResult> {
+    return this.request(`/v1/turns/${encodeURIComponent(input.turnId)}/retrieve`, {
       method: "POST",
       body: JSON.stringify(input),
     });

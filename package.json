@@ -6,12 +6,12 @@
   "description": "A local-first, risk-aware memory runtime for Claude Code, Codex, and other agents.",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/MattSureham/long-term-mem.git"
+    "url": "git+https://github.com/MattSureham/memoryd.git"
   },
   "bugs": {
-    "url": "https://github.com/MattSureham/long-term-mem/issues"
+    "url": "https://github.com/MattSureham/memoryd/issues"
   },
-  "homepage": "https://github.com/MattSureham/long-term-mem#readme",
+  "homepage": "https://github.com/MattSureham/memoryd#readme",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {

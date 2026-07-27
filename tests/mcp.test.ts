@@ -14,6 +14,8 @@ describe("MCP adapter", () => {
       beginTurn: runtime.beginTurn.bind(runtime),
       checkpointEvidence: async (input: Parameters<typeof runtime.checkpointEvidence>[0]) => runtime.checkpointEvidence(input),
       recall: async (input: Parameters<typeof runtime.recall>[0]) => runtime.recall(input),
+      retrieveMemory: async (input: Parameters<typeof runtime.retrieveMemory>[0]) =>
+        runtime.retrieveMemory(input),
       getSources: async (turnId: string, sourceRefs: Parameters<typeof runtime.getSources>[1]) =>
         runtime.getSources(turnId, sourceRefs),
       submitCorrection: async (input: Parameters<typeof runtime.submitCorrection>[0]) => runtime.submitCorrection(input),
@@ -34,6 +36,7 @@ describe("MCP adapter", () => {
         "memory_complete_turn",
         "memory_get_sources",
         "memory_recall",
+        "memory_retrieve",
         "memory_submit_correction",
       ]);
 
@@ -56,6 +59,14 @@ describe("MCP adapter", () => {
       });
       expect(blocked.isError).toBe(true);
       expect(blocked.content).toEqual([
+        expect.objectContaining({ type: "text", text: expect.stringContaining("STAGE_BLOCKED") }),
+      ]);
+      const objectBlocked = await client.callTool({
+        name: "memory_retrieve",
+        arguments: { turnId: plan.turnId, query: "scene" },
+      });
+      expect(objectBlocked.isError).toBe(true);
+      expect(objectBlocked.content).toEqual([
         expect.objectContaining({ type: "text", text: expect.stringContaining("STAGE_BLOCKED") }),
       ]);
     } finally {

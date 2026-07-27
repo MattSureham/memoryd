@@ -4,7 +4,7 @@
 
 `memoryd` is a local-first long-term memory MVP for Claude Code, Codex and other agents. It stores raw visible events, facts, task episodes and behavioral policies in a single authoritative SQLite database, and performs risk recognition and evidence gating *before* any historical content is retrieved.
 
-Current release: `0.1.0`, protocol version `1.1`. The project is not yet published to npm; build and link from source.
+Current release: `0.1.0`, protocol version `1.2`, SQLite schema `v7`. The project is not yet published to npm; build and link from source.
 
 ## Architecture at a glance
 
@@ -15,29 +15,35 @@ flowchart TD
     A["User input"] --> B["Feature extractor"]
     B --> C["Risk Recognizer<br/>rule router + light classifier"]
     C --> D["Cognitive Mode Controller<br/>mode + intensity + retrieval order"]
-    D --> E["Gated hybrid retrieval<br/>FTS5/BM25 + vectors + entities + time"]
-    E --> F["Main reasoning<br/>(under active constraints)"]
+    D --> E["Object / Partition routing<br/>bounded coarse-to-fine retrieval"]
+    E --> F["Episode / Semantic / Raw Evidence expansion"]
     F --> G["Verifier"]
     G --> H["Answer"]
     H -. "correction" .-> I["attribution → clustering → threshold"]
     I -. "human approval" .-> J["Calibration / Trigger update"]
     J -. "feeds" .-> C
+    H -. "incremental jobs" .-> K["Memory Curator<br/>merge / split / rename / temperature / archive"]
+    K -. "evolves object graph" .-> E
 ```
 
-The three-layer memory model — constraints are memory too:
+The authority, memory, and dynamic-routing layers:
 
 ```mermaid
 flowchart TB
-    W["World Memory<br/>'What is the world like?' — exact match + entity graph traversal"]
-    E["Episode Memory<br/>'What did we go through?' — originals, not summaries; summaries are only indexes"]
-    P["Policy Memory<br/>'How should I think?' — scoped, with lifecycles; policies never decay, only trigger activation frequency does"]
-    W --- E --- P
+    R["Raw Evidence / SourceEvent<br/>the factual authority summaries cannot replace"]
+    E["Episode Memory<br/>context, time, participants, eventRefs"]
+    S["Semantic Memory / WorldClaim<br/>confidence, versions, conflicts, sources"]
+    P["Policy Memory<br/>scope, dependencies, approval, sources"]
+    O["Memory Object + Partition + Graph<br/>dynamic merge, split, reorganization, lifecycle"]
+    O --> E --> R
+    O --> S --> R
+    P --> R
 ```
 
 ## Implemented capabilities
 
 - A unified `memoryd` sidecar exposing a localhost HTTP API and a stdio MCP server.
-- Persistence for `SourceEvent`, `WorldClaim`, `Episode`, `Policy`, corrections and turn traces.
+- Persistence for `SourceEvent`, `WorldClaim`, `Episode`, `Policy`, Memory Object, Partition, Relationship, Version, Contradiction, Temperature, corrections and retrieval/turn traces.
 - Rule-based risk recognition, structured triggers and per-agent-profile calibration; the optional HTTP classifier receives only compressed features, never raw prompts or history text.
 - `TurnPlan`, current-evidence checkpoints, server-side retrieval gates, and risk-driven retrieval & policy schedules generated per turn.
 - Recall bounded by `snapshotRevision`, with source authorization via in-turn checkpoint/recall traces.
@@ -45,17 +51,21 @@ flowchart TB
 - Concurrent fact corrections are kept as `disputed` versions — no silent last-write-wins.
 - Raw text is redacted against known credential patterns, then encrypted with AES-256-GCM; FTS stores only redacted derived text.
 - Source-backed fact and narrative episode recall, coverage-aware hybrid reranking, redacted original-event expansion, and Re-experience worksets.
+- Protocol 1.2 `memory_retrieve`: query analysis → risk profile → object/partition routing → local members → episode/raw evidence, with direct/derived/inferred/conflicted results kept distinct.
+- Bounded dynamic indexes with configurable object, partition, candidate, fan-out and expansion-depth limits.
+- An independent Memory Curator with persistent jobs, leases, retries, dry-run, audit and rollback for merge, split, rename, reorganization, summary refresh, temperature/archive, integrity, quality and reindex.
+- Hot/Warm/Cold/Archive lifecycle: cold requires an exact route, archive is opt-in, and explicit retrieval can reactivate it.
 - Safe learning from repeated corrections: FailureCluster → trigger candidate / calibration shadow; a background worker runs replay analysis, and learned policies still require human approval.
 - L1/L2/L3/Archive policy scheduling, fail-closed dependency-graph checks, and a lifecycle that decays only trigger background priority.
 - Multi-turn narrative chunking, rebuildable episodes, SessionEnd finalization and session lifecycle protection.
 - Hooks/MCP/Skills installers for Claude Code and Codex; generic agents can use MCP, HTTP or the hook wrapper.
-- Local administration commands: inspect, policy approve/revoke, forget, encrypted export/import, reindex and health checks.
+- Local administration commands: inspect, policy approve/revoke, Curator, maintenance rollback, forget, encrypted export/import, reindex and health checks.
 
 It is not a cloud sync service, a multi-user service, or a universal judge that automatically understands every fact and policy violation; the default embedding is a local deterministic feature hash, not an external foundation model. See [Design coverage & implementation status](#design-coverage--implementation-status) and [MVP boundaries](#mvp-boundaries).
 
 ## Design coverage & implementation status
 
-The following audits `0.1.0` against [记忆架构.md](记忆架构.md) and [记忆架构讨论原文.md](记忆架构讨论原文.md) (design docs in Chinese). Conclusion: **online control, gated hybrid retrieval and the safe slow-learning loop are all in place; learned behavioral policies deliberately keep a human approval gate.**
+The following audits `0.1.0` against [记忆架构.md](记忆架构.md), [记忆架构讨论原文.md](记忆架构讨论原文.md), and sustained-growth requirements. Conclusion: **online control, evidence gating, object routing and safe learning are in place; memory no longer depends on one unbounded flat index, and the Curator incrementally merges, splits, reorganizes, cools and archives it. Learned behavioral policies deliberately retain a human approval gate.**
 
 ### Implemented
 
@@ -76,6 +86,12 @@ The following audits `0.1.0` against [记忆架构.md](记忆架构.md) and [记
 | Re-experience pack | `memory_build_workset` / the `reexperience` stage composes raw visible events, complete historical episodes, key/emotional events, correction anchors and fact constraints from a window of the last 20–50 completed turns under a token budget; episodes are selected atomically, never splitting original ranges. |
 | Narrative chunking & session lifecycle | [src/core/narrative.ts](src/core/narrative.ts) merges or splits multi-turn episodes by session, time gaps, task type, corrections, entity/topic shifts, explicit boundaries and size limits; SessionEnd closes the current chunk and blocks further begins on the ended session, and `reindex` can rebuild from authoritative events/traces. |
 | Background slow layer | The daemon processes persistent, retryable learning jobs every `MEMORYD_LEARNING_INTERVAL_MS`; `memoryctl learn --once` triggers manually, and `memoryctl inspect --all` exposes clusters, triggers, calibration and queue state. |
+| Raw / Episode / Semantic / Object layers | SourceEvent is Raw Evidence; Episodes preserve context and `eventRefs`; WorldClaims keep confidence, versions and conflicts; Memory Objects provide bounded local working sets. |
+| Dynamic object graph and partitions | [src/curator.ts](src/curator.ts) implements stable-ID attach, merge, split and rename; original nodes survive, graph relations and versions retain provenance, overflowing partitions become bounded routers, and session facts stay in session-ACL partitions. The hot path reads only bounded rows from routed leaf partitions and does not populate a global Object FTS. |
+| Risk-driven staged retrieval | `retrieveMemory()` analyzes query/risk, routes objects, expands object → episode/semantic → raw as needed, and returns coverage plus `shouldAbstain`. |
+| Lifecycle and maintenance | Temperature controls hot/warm/cold/archive routing. Persistent maintenance jobs provide leases, retry, dry-run, audit and monotonic-version rollback. |
+| Quality-driven evolution | Retrieval samples persist routed vs. returned objects, subtopic clusters, query-hit dispersion, summary fidelity, local-use ratio, evidence coverage and conflict/orphan proxies; configurable thresholds feed summary refresh and split decisions. |
+| Schema v7 migration | v6→v7 only adds a scope registry plus object-graph, lifecycle, retrieval-trace and maintenance tables; Raw Evidence is not rewritten, and objects are built incrementally. |
 
 ### Safety constraints & remaining boundaries
 
@@ -84,16 +100,18 @@ The following audits `0.1.0` against [记忆架构.md](记忆架构.md) and [记
 - SessionEnd does not physically delete session policies; it ends the session, closes the narrative chunk and stops the scope from serving new turns. Content deletion still requires an explicit `forget`.
 - Automatic fact extraction, a full semantic verifier, continuous sync and mutually-distrusting multi-user isolation remain out of scope.
 
-**In one sentence:** "risk recognition → mode switching → gated hybrid retrieval → original workset → verification → correction → shadow/replay learning" is a working closed loop; humans still hold the final behavioral authority over learned policies.
+**In one sentence:** both "risk → mode → object route → local evidence → verification" and "incremental ingest → merge/split/reorganize → temperature/archive → quality audit" are working loops; humans still hold final behavioral authority over learned policies.
 
 ## Runtime layout
 
 ```mermaid
 flowchart TD
     CC["Claude Code"] & CX["Codex"] & AG["Other agents"] --> HK["Hooks + Skills + MCP (stdio)"]
-    HK -->|"HTTP · 127.0.0.1:7337"| D["memoryd daemon<br/>Risk + Trigger → TurnPlan → Gate → Hybrid Recall → Verifier"]
+    HK -->|"HTTP · 127.0.0.1:7337"| D["memoryd daemon<br/>Risk → Gate → Object Route → Evidence → Verifier"]
     D --> LW["learning worker<br/>shadow / replay"]
-    D --> DB[("SQLite WAL + FTS5 + local vectors<br/>AES-256-GCM encryption")]
+    D --> CU["Memory Curator<br/>merge / split / lifecycle / audit"]
+    D --> DB[("SQLite WAL + FTS5 + local vectors<br/>Object Graph + AES-256-GCM")]
+    CU --> DB
     D <-.->|"import / export (optional)"| OB["Obsidian vault<br/>human-readable mirror"]
 ```
 
@@ -162,8 +180,18 @@ memoryctl install all --scope user
 | `MEMORYD_RISK_CLASSIFIER_URL` | unset | Optional HTTP risk classifier URL |
 | `MEMORYD_RISK_CLASSIFIER_TOKEN` | unset | Classifier Bearer token |
 | `MEMORYD_LEARNING_INTERVAL_MS` | `5000` | Daemon slow-learning queue poll interval; minimum 1000 ms |
+| `MEMORYD_CURATOR_INTERVAL_MS` | `15000` | Maintenance queue poll interval; periodic workspace scans are hourly-idempotent |
+| `MEMORYD_MAX_NODE_TOKENS` / `MAX_OBJECT_MEMBERS` / `TARGET_OBJECT_MEMBERS` | `1800` / `24` / `12` | Object-size and split bounds |
+| `MEMORYD_MAX_CANDIDATE_COUNT` / `MAX_ROUTED_OBJECTS` / `MAX_EXPANSION_DEPTH` | `80` / `8` / `3` | Coarse-to-fine retrieval bounds |
+| `MEMORYD_SPLIT_MIN_MEMBERS` / `MERGE_SIMILARITY` | `6` / `0.78` | Automatic split support and merge threshold |
+| `MEMORYD_MIN_SUBTOPIC_CLUSTERS` / `MAX_QUERY_HIT_DISPERSION` | `2` / `0.70` | Subtopic separation and dispersed-hit split signals |
+| `MEMORYD_MIN_SUMMARY_FIDELITY` / `MIN_LOCAL_USE_RATIO` / `MIN_RETRIEVAL_SAMPLES` | `0.45` / `0.20` / `5` | Summary distortion, actual local usage and minimum retrieval sample count |
+| `MEMORYD_COLD_AFTER_DAYS` / `ARCHIVE_AFTER_DAYS` | `90` / `365` | Lifecycle age thresholds |
+| `MEMORYD_CURATOR_BATCH_SIZE` / `MAINTENANCE_LEASE_MS` / `MAINTENANCE_MAX_ATTEMPTS` | `50` / `60000` / `5` | Incremental batch, lease, and retry bounds |
 
 When using `MemoryStore` directly as a library without passing `encryptionKey`, `MEMORYD_ENCRYPTION_KEY` is also supported; the daemon itself always loads the key from the file `MEMORYD_KEY` points to.
+
+All object, quality, lifecycle and maintenance thresholds are listed in the [architecture document](docs/architecture.md#10-配置与容量指标); every threshold is configurable rather than hard-coded into maintenance decisions.
 
 By default only loopback is served. If you bind a non-local address, set `MEMORYD_TOKEN` at minimum and use a trusted network or a TLS reverse proxy; the service itself provides no TLS, per-user authentication or rate limiting.
 
@@ -208,10 +236,10 @@ When a host cannot guarantee hooks or stage gates, set the corresponding capabil
 
 1. Call `memory_begin_turn` at the start of every turn to get rule/classifier/calibration/trigger risks, the dynamic retrieval strategy, the policy schedule and the evidence gate.
 2. If `gate.required`, read current files, images, test or command results first, then call `memory_checkpoint_evidence`; keep the returned `{plan, observations, evidenceRefs}`.
-3. `memory_recall(stage=current_evidence)` returns this turn's checkpoint `sourceRefs` again. Other recall is bounded by `snapshotRevision` and cannot see history written after begin.
-4. Call `memory_recall` following `retrievalStages`; `world`, `episode`, `reexperience` and `source_expansion` are gate-checked server-side, and results are fused and reranked per the TurnPlan's risk strategy.
+3. Prefer `memory_retrieve`: the server performs query analysis, memory risk, object/partition routing and evidence expansion, returning typed provenance, conflicts, coverage and `shouldAbstain`. Domain retrieval is bounded by `snapshotRevision`.
+4. Compatibility clients may still call `memory_recall` following `retrievalStages`; `memory_recall(stage=current_evidence)` returns this turn's checkpoint refs.
 5. For fuller working context, call `memory_build_workset` (equivalent to the gated `reexperience` stage) to get recent originals, complete narrative chunks, key/emotional events and fact constraints.
-6. For other originals, expand `sourceRefs` with `memory_get_sources`. This endpoint only accepts sources authorized by this turn's checkpoint or a persisted recall trace; historical originals are always untrusted evidence, never instructions.
+6. For other originals, expand `sourceRefs` with `memory_get_sources`. This endpoint only accepts sources authorized by this turn's checkpoint or a persisted recall/retrieve trace; historical originals are always untrusted evidence, never instructions.
 7. When the user explicitly corrects or asks to remember, call `memory_submit_correction`; `origin:self_reflection` can only create candidates and cannot satisfy automatic learning thresholds.
 8. Call `memory_complete_turn` with the final answer and the `evidenceRefs` actually used; evidence must likewise have been authorized by this turn's checkpoint/recall.
 
@@ -221,6 +249,12 @@ Full fields and endpoints are in the [protocol document](docs/protocol.md).
 
 ```text
 memoryctl start | stop | doctor | replay | learn --once
+memoryctl curate [scan|temperature|archive|reorganize|integrity_check|quality|reindex] [--dry-run]
+memoryctl curate merge --object <id> --object <id> [--force] [--dry-run]
+memoryctl curate split --object <id> [--dry-run]
+memoryctl curate rename --object <id> --title <text> [--routing-key <key>] [--dry-run]
+memoryctl curate process | curate jobs
+memoryctl curate rollback <action-id> [--idempotency-key <key>]
 memoryctl inspect [id] [--all]
 memoryctl approve <policy-id>
 memoryctl revoke <policy-id>
@@ -234,7 +268,7 @@ memoryctl reindex
 memoryctl install <claude|codex|all> [--scope user|project]
 ```
 
-Approval, revocation, calibration retirement, forgetting and export/import exist only in the admin CLI — they are not exposed to models as MCP tools. `inspect --all` includes candidate/inactive records, triggers and learning jobs across sessions in the current workspace. A learned candidate becomes eligible for `approve` (which counts this CLI action as human confirmation) only after matching a non-entity-specific cluster of at least 3 independent user corrections across 2 sessions; approval also rejects policy dependency cycles and activates associated triggers. Explicit user policies are exempt from the learning threshold. `learn --once` processes learnable clusters in the current scope immediately; the daemon otherwise consumes the queue in the background. `forget` takes an entity type and the stable public ID returned by `inspect`; prefer `revoke` for simply disabling a policy. Deletion removes authoritative content, FTS, embedding buckets, entity relations and associated derived records, leaving a tombstone that contains no deleted content. Forgetting a claim, policy, episode, correction or observation with sources also deletes its original SourceEvent; forgetting a SourceEvent in turn deletes every memory, turn/trace and index referencing it. Forgetting a WorldClaim or Policy public ID deletes all versions of that identity, so no historical content lingers or old versions come back into effect. This cascade prioritizes privacy completeness and may delete other derived memories sharing the same source.
+Approval, revocation, calibration retirement, Curator operations, forgetting and export/import exist only in the admin CLI — they are not exposed to models as MCP tools. `inspect --all` includes objects, partitions, temperatures, contradictions, maintenance queues/audit, candidate/inactive records, triggers and learning jobs. `curate scan --dry-run` previews decisions; reversible merge/split/rename/move actions use `curate rollback`, which creates a new restore version rather than moving history backwards. A learned candidate becomes eligible for `approve` only after matching a non-entity-specific cluster of at least 3 independent user corrections across 2 sessions; approval also rejects policy dependency cycles and activates associated triggers. Explicit user policies are exempt from the learning threshold. `forget` takes an entity type and the stable public ID returned by `inspect`; prefer `revoke` for simply disabling a policy. Deletion removes authoritative content, objects/relations/versions, FTS, embedding buckets, entity relations and associated derived records, leaving a content-free tombstone. This cascade prioritizes privacy completeness and may delete other derived memories sharing the same source.
 
 Exports without a passphrase are encrypted with the local master key and generally only suit the same-key environment; cross-device transfer should use an explicit high-entropy passphrase. Currently the passphrase is normalized directly into an AES key — no password-hard KDF is used.
 
@@ -262,7 +296,7 @@ See the [architecture document](docs/architecture.md) for the fuller trust bound
 
 ## Degraded behavior
 
-When hooks cannot reach the daemon, they let the agent keep working and return a "memory unavailable — do not claim recall" notice on SessionStart/UserPromptSubmit; other hooks return silently. Failed events enter an encrypted, per-file idempotent queue; a later successful SessionStart or `memoryctl replay` backfills them in order. Learning jobs have a daemon background worker with retry; the hook failure spool still has no background backoff, corrupt-entry quarantine or automatic cleanup.
+When hooks cannot reach the daemon, they let the agent keep working and return a "memory unavailable — do not claim recall" notice on SessionStart/UserPromptSubmit; other hooks return silently. Failed events enter an encrypted, per-file idempotent queue; a later successful SessionStart or `memoryctl replay` backfills them in order. Learning and maintenance jobs have daemon workers, leases and retry; the hook failure spool still has no background backoff, corrupt-entry quarantine or automatic cleanup.
 
 When the optional risk classifier times out or fails, the deterministic rules keep running. `MemoryClient` defaults to a 2-second HTTP timeout; MCP and hooks reach the daemon through it.
 
@@ -275,7 +309,7 @@ Not currently implemented:
 - Continuous or cloud sync, cross-device conflict merging, workspace identity remapping; only encrypted export/import and tombstones.
 - Background continuous hook spool replay, backoff scheduling and automatic quarantine of corrupt entries; replay currently happens sequentially on SessionStart or explicit CLI invocation. Slow learning jobs are a separate queue and not the same as hook replay.
 - Automatic structured fact extraction from arbitrary conversations; WorldClaims and Policies mainly come from explicit corrections. Episodes are chunked automatically, but summaries/topics remain deterministic heuristics, not a general semantic summarizer.
-- External neural embedding services, general-purpose ANN vector stores and full knowledge-graph reasoning; the current setup is local hash-ngram embeddings, bucket candidates and one-hop entity relation/owner indexes.
+- External neural embedding services, general-purpose ANN vector stores, automatic relation extraction and arbitrary-depth graph reasoning; the current setup has first-class object/relation graphs, local hash-ngram embeddings, bucket candidates and bounded local traversal.
 - A full semantic verifier. The built-in verifier detects a small set of "claims to remember without evidence" phrasings and merges issues reported by an external `verifierResult`; external status can only tighten the result and cannot bypass the deterministic floor with `pass`.
 - A strongly isolated multi-user service, remote TLS, key rotation and background backups.
 
@@ -290,7 +324,7 @@ pnpm build
 pnpm bench
 ```
 
-Tests cover the protocol, storage, runtime, adapters, learning, retrieval, embeddings and narrative chunking. The benchmark writes 100k temporary events by default and reports preflight/recall p95 alongside their targets; targets are not performance guarantees on every machine. Tune the scale with `MEMORYD_BENCH_EVENTS` and `MEMORYD_BENCH_ITERATIONS`.
+Tests cover protocol, storage, runtime, adapters, learning, retrieval, embeddings, narrative chunking, object aggregation/provenance, automatic and explicit split, quality signals, merge/rename rollback, lifecycle reactivation, session ACLs, starvation-free incremental backfill, conflicts, Curator retry, partition reorganization, v6→v7 migration, import/export and forget cascades. The benchmark writes 100k temporary events by default and reports preflight/recall p95 alongside their targets; targets are not performance guarantees on every machine. Tune the scale with `MEMORYD_BENCH_EVENTS` and `MEMORYD_BENCH_ITERATIONS`.
 
 The protocol JSON Schema lives at `schemas/memory-protocol-v1.schema.json`. Design background (in Chinese): `记忆架构.md` and `记忆架构讨论原文.md`.
 

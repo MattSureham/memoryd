@@ -16,6 +16,8 @@ import {
 import { installAdapters, type InstallScope, type InstallTarget } from "./install.js";
 import { exportObsidianVault, importObsidianVault } from "./adapters/obsidian.js";
 import { resolvePolicyDependencies } from "./core/index.js";
+import { MemoryCurator } from "./curator.js";
+import type { MaintenanceJobType } from "./contracts.js";
 import { MemoryRuntime } from "./runtime.js";
 import { MemoryStore, type ForgetSelector, type StoredPolicy } from "./storage/index.js";
 
@@ -35,6 +37,12 @@ function output(value: unknown): void {
 function usage(): never {
   process.stderr.write(`memoryctl commands:
   start | stop | doctor | replay | learn --once
+  curate [scan|temperature|archive|reorganize|integrity_check|quality|reindex] [--dry-run]
+  curate merge --object <id> --object <id> [--force] [--dry-run]
+  curate split --object <id> [--dry-run]
+  curate rename --object <id> --title <text> [--routing-key <key>] [--dry-run]
+  curate process | curate jobs
+  curate rollback <action-id> [--idempotency-key <key>]
   inspect [id] [--all]
   approve <policy-id> | revoke <policy-id>
   calibration retire <pattern-id>
@@ -141,6 +149,14 @@ function inspect(id: string | undefined, includeAll: boolean): void {
       triggers: store.listTriggers(scope, administrative),
       calibrationPatterns: store.listCalibrationPatternsForScope(scope, administrative),
       learningJobs: store.listLearningJobs(undefined, scope),
+      memoryPartitions: store.listMemoryPartitions(scope, { includeArchived: administrative }),
+      memoryObjects: store.listMemoryObjects(scope, {
+        ...(administrative ? {} : { statuses: ["active", "router"] }),
+      }),
+      contradictions: store.listContradictions(scope, { includeResolved: administrative }),
+      memoryTemperatures: store.listMemoryTemperatures(scope),
+      maintenanceJobs: store.listMaintenanceJobs(scope),
+      maintenanceAudit: administrative ? store.listMaintenanceAudit(scope) : [],
     };
     if (id === undefined) output(data);
     else {
@@ -214,6 +230,86 @@ function learnOnce(): void {
   }
 }
 
+function repeatedOptions(args: string[], name: string): string[] {
+  return args.flatMap((value, index) => value === name && args[index + 1] !== undefined
+    ? [args[index + 1] as string]
+    : []);
+}
+
+function curate(args: string[]): void {
+  const store = openStore();
+  try {
+    const config = loadConfig();
+    const curator = new MemoryCurator(store, { config: config.evolution });
+    const command = args[1] ?? "scan";
+    if (command === "process") {
+      output(curator.processJobs(config.evolution.curatorBatchSize));
+      return;
+    }
+    if (command === "jobs") {
+      output({
+        jobs: store.listMaintenanceJobs(currentScope()),
+        audit: store.listMaintenanceAudit(currentScope()),
+      });
+      return;
+    }
+    if (command === "rollback") {
+      const actionId = args[2];
+      if (actionId === undefined) throw new Error("curate rollback requires an action ID");
+      output(curator.rollback(
+        actionId,
+        option(args, "--idempotency-key") ?? `cli:rollback:${actionId}`,
+      ));
+      return;
+    }
+    const allowed = new Set([
+      "scan",
+      "merge",
+      "split",
+      "rename",
+      "temperature",
+      "archive",
+      "reorganize",
+      "refresh_summary",
+      "integrity_check",
+      "quality",
+      "reindex",
+    ]);
+    if (!allowed.has(command)) throw new Error(`Unsupported curator command ${command}`);
+    const objectIds = repeatedOptions(args, "--object");
+    const payload: Record<string, unknown> =
+      command === "merge"
+        ? { objectIds, force: has(args, "--force") }
+        : command === "split" || command === "refresh_summary"
+          ? { objectId: objectIds[0] }
+          : command === "rename"
+            ? {
+                objectId: objectIds[0],
+                title: option(args, "--title"),
+                routingKeys: repeatedOptions(args, "--routing-key"),
+              }
+          : {};
+    if (command === "merge" && objectIds.length < 2) {
+      throw new Error("curate merge requires at least two --object values");
+    }
+    if ((command === "split" || command === "refresh_summary") && objectIds[0] === undefined) {
+      throw new Error(`curate ${command} requires --object <id>`);
+    }
+    if (command === "rename" && (objectIds[0] === undefined || option(args, "--title") === undefined)) {
+      throw new Error("curate rename requires --object <id> and --title <text>");
+    }
+    output(curator.run(currentScope(), {
+      type: command as MaintenanceJobType,
+      payload,
+      dryRun: has(args, "--dry-run"),
+      idempotencyKey: option(args, "--idempotency-key")
+        ?? `cli:${command}:${Date.now()}:${has(args, "--dry-run") ? "dry" : "apply"}`,
+    }));
+  } finally {
+    store.close();
+  }
+}
+
 function forget(entityType: string, entityId: string, reason: string): void {
   const store = openStore();
   try {
@@ -278,6 +374,7 @@ async function main(args = process.argv.slice(2)): Promise<void> {
   if (command === "doctor") return await doctor();
   if (command === "replay") return output(await replayHookSpool());
   if (command === "learn" && has(args, "--once")) return learnOnce();
+  if (command === "curate") return curate(args);
   if (command === "inspect") return inspect(args[1], has(args, "--all"));
   if (command === "approve" && args[1] !== undefined) return changePolicy(args[1], "approved");
   if (command === "revoke" && args[1] !== undefined) return changePolicy(args[1], "revoked");

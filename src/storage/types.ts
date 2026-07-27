@@ -1,7 +1,17 @@
 import type {
   AgentProfile,
   CorrectionInput,
+  Contradiction,
   EpisodeMemory,
+  MaintenanceAction,
+  MaintenanceJob,
+  MemoryObject,
+  MemoryObjectMember,
+  MemoryPartition,
+  MemoryQualityMetrics,
+  MemoryRelation,
+  MemoryTemperature,
+  MemoryVersion,
   Observation,
   PolicyRef,
   ScopeRef,
@@ -155,6 +165,23 @@ export interface OwnerMetadata {
   sessionId?: string;
 }
 
+export interface MemoryObjectRouteHit {
+  object: MemoryObject;
+  score: number;
+  exact: boolean;
+}
+
+export interface MaintenanceAuditRecord {
+  auditId: string;
+  revision: number;
+  scope: ScopeRef;
+  jobId?: string;
+  actionId?: string;
+  event: string;
+  details: Record<string, unknown>;
+  createdAt: string;
+}
+
 export interface SourceEventListOptions {
   includeAllSessions?: boolean;
   maxRevision?: number;
@@ -204,7 +231,7 @@ export interface TriggerActivationRecord {
   activatedAt: string;
 }
 
-export type SearchKind = "source_event" | "world_claim" | "policy" | "episode";
+export type SearchKind = "source_event" | "world_claim" | "policy" | "episode" | "memory_object";
 
 export interface SearchHit {
   kind: SearchKind;
@@ -222,6 +249,7 @@ export interface StorageSearchResult {
   worldClaims: WorldClaim[];
   policies: StoredPolicy[];
   episodes: EpisodeMemory[];
+  memoryObjects: MemoryObject[];
 }
 
 export interface SearchOptions {
@@ -279,4 +307,22 @@ export interface StoreHealth {
   endedSessions?: number;
   embeddingCount?: number;
   entityEdgeCount?: number;
+  memoryObjectCount?: number;
+  partitionCount?: number;
+  pendingMaintenanceJobs?: number;
+  failedMaintenanceJobs?: number;
+  maintenanceBacklog?: number;
 }
+
+export type {
+  Contradiction,
+  MaintenanceAction,
+  MaintenanceJob,
+  MemoryObject,
+  MemoryObjectMember,
+  MemoryPartition,
+  MemoryQualityMetrics,
+  MemoryRelation,
+  MemoryTemperature,
+  MemoryVersion,
+};

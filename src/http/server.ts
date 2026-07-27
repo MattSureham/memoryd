@@ -13,6 +13,7 @@ import {
   EndSessionSchema,
   InputEventSchema,
   RecallSchema,
+  RetrieveMemorySchema,
   SourceRefSchema,
   TurnScopeSchema,
 } from "../schemas.js";
@@ -128,6 +129,8 @@ export function createMemoryHttpServer(runtime: MemoryRuntime, config: RuntimeCo
             reexperienceWorkset: true,
             triggerLearning: true,
             sessionLifecycle: true,
+            objectRoutedRetrieval: true,
+            dynamicMemoryCurator: true,
           },
         });
         return;
@@ -165,6 +168,13 @@ export function createMemoryHttpServer(runtime: MemoryRuntime, config: RuntimeCo
         const input = RecallSchema.parse(await readJson(request));
         assertTurnPath(decodeURIComponent(recall[1]), input.turnId);
         json(response, 200, runtime.recall(input as never));
+        return;
+      }
+      const retrieve = url.pathname.match(/^\/v1\/turns\/([^/]+)\/retrieve$/);
+      if (method === "POST" && retrieve?.[1] !== undefined) {
+        const input = RetrieveMemorySchema.parse(await readJson(request));
+        assertTurnPath(decodeURIComponent(retrieve[1]), input.turnId);
+        json(response, 200, runtime.retrieveMemory(input as never));
         return;
       }
       const workset = url.pathname.match(/^\/v1\/turns\/([^/]+)\/workset$/);

@@ -15,6 +15,7 @@ export function startDaemon(): { close: () => Promise<void> } {
   const classifier = riskClassifierFromEnvironment();
   const runtime = new MemoryRuntime(store, {
     ...(classifier === undefined ? {} : { classifier }),
+    evolutionConfig: config.evolution,
   });
   const server = createMemoryHttpServer(runtime, config);
   server.listen(config.port, config.host, () => {
@@ -28,9 +29,18 @@ export function startDaemon(): { close: () => Promise<void> } {
     }
   }, config.learningIntervalMs);
   learningTimer.unref();
+  const curatorTimer = setInterval(() => {
+    try {
+      runtime.processMaintenanceJobs(config.evolution.curatorBatchSize);
+    } catch (error) {
+      console.error(`memoryd curator worker: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, config.curatorIntervalMs);
+  curatorTimer.unref();
 
   const close = async (): Promise<void> => {
     clearInterval(learningTimer);
+    clearInterval(curatorTimer);
     await new Promise<void>((resolve, reject) => {
       server.close((error) => (error === undefined ? resolve() : reject(error)));
     });

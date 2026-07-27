@@ -4,7 +4,7 @@
 
 `memoryd` 是一个面向 Claude Code、Codex 和其他 Agent 的本地优先长期记忆 MVP。它把原始可见事件、事实、任务片段和行为策略放进同一个 SQLite 权威存储，并在检索历史内容前执行风险识别与证据门控。
 
-当前版本为 `0.1.0`，协议版本为 `1.1`。项目尚未发布到 npm，需从源码构建和链接。
+当前版本为 `0.1.0`，协议版本为 `1.2`，SQLite schema 为 `v7`。项目尚未发布到 npm，需从源码构建和链接。
 
 ## 架构一览
 
@@ -15,29 +15,35 @@ flowchart TD
     A["用户输入"] --> B["特征提取"]
     B --> C["Risk Recognizer<br/>规则路由 + 轻量分类器"]
     C --> D["Cognitive Mode Controller<br/>模式 + 强度 + 检索顺序"]
-    D --> E["门控混合检索<br/>FTS5/BM25 + 向量 + 实体 + 时间"]
-    E --> F["主推理（活跃约束下）"]
+    D --> E["Object / Partition 路由<br/>bounded coarse-to-fine retrieval"]
+    E --> F["Episode / Semantic / Raw Evidence 展开"]
     F --> G["Verifier 自检"]
     G --> H["回答"]
     H -. "纠错" .-> I["归因 → 聚类 → 阈值"]
     I -. "人工批准" .-> J["Calibration / Trigger 更新"]
     J -. "喂养" .-> C
+    H -. "增量任务" .-> K["Memory Curator<br/>merge / split / rename / temperature / archive"]
+    K -. "更新对象图" .-> E
 ```
 
-三层记忆模型，约束本身也是记忆：
+权威证据、记忆层和动态路由层：
 
 ```mermaid
 flowchart TB
-    W["World Memory · 世界模型<br/>回答“世界什么样”——精确匹配 + 实体关系遍历"]
-    E["Episode Memory · 原始经历<br/>回答“一起经历了什么”——存原文不存摘要，摘要只是索引"]
-    P["Policy Memory · 推理策略<br/>回答“应该怎么思考”——有作用域和生命周期；Policy 不衰减，只衰减 Trigger 激活频率"]
-    W --- E --- P
+    R["Raw Evidence / SourceEvent<br/>不可被摘要替代的事实底座"]
+    E["Episode Memory<br/>情境、时间、参与者、eventRefs"]
+    S["Semantic Memory / WorldClaim<br/>confidence、版本、冲突、来源"]
+    P["Policy Memory<br/>作用域、依赖、审批、来源"]
+    O["Memory Object + Partition + Graph<br/>动态合并、拆分、重组和生命周期"]
+    O --> E --> R
+    O --> S --> R
+    P --> R
 ```
 
 ## 已实现能力
 
 - 统一的 `memoryd` sidecar，提供 localhost HTTP API 和 stdio MCP server。
-- `SourceEvent`、`WorldClaim`、`Episode`、`Policy`、纠错与 Turn trace 的持久化。
+- `SourceEvent`、`WorldClaim`、`Episode`、`Policy`、Memory Object、Partition、Relationship、Version、Contradiction、Temperature、纠错与 Retrieval/Turn trace 的持久化。
 - 规则风险识别、结构化 Trigger 和按 Agent profile 隔离的 Calibration；可选 HTTP classifier 只接收压缩特征，不接收原始 prompt 或历史文本。
 - `TurnPlan`、当前证据 checkpoint、服务端检索门，以及按风险动态生成的检索和 Policy 调度计划。
 - 基于 `snapshotRevision` 的召回上界，以及 turn 内 checkpoint/recall trace 的来源授权。
@@ -45,17 +51,21 @@ flowchart TB
 - 并发事实纠错以 disputed 版本保留，不执行静默 last-write-wins。
 - 原文先按已知凭据模式脱敏，再用 AES-256-GCM 加密；FTS 只保存脱敏后的派生文本。
 - 带来源的事实与叙事 Episode 召回、coverage-aware 混合重排、原始脱敏事件展开和 Re-experience 工作集。
+- 协议 1.2 的 `memory_retrieve`：Query Analysis → Risk Profile → Object/Partition 路由 → 局部成员 → Episode/Raw Evidence，结构化区分 direct、derived、inferred 和 unresolved contradiction。
+- 有界动态索引：对象/分区容量、候选数、fan-out 和展开深度均可配置；升级后的旧数据可走有界 fallback，再由后台渐进生成对象。
+- 独立 Memory Curator：持久化 job、lease、重试、dry-run、审计和回滚；支持 merge、split、rename、reorganize、summary refresh、temperature/archive、integrity、quality 和 reindex。
+- Hot/Warm/Cold/Archive 生命周期；cold 只在精确命中时召回，archive 默认排除，显式回溯可重新激活。
 - 重复纠错的安全学习：FailureCluster → Trigger candidate / Calibration shadow；后台 worker 执行回放分析，学习 Policy 仍需人工批准。
 - Policy 的 L1/L2/L3/Archive 调度、依赖图 fail-closed 检查，以及只衰减 Trigger 后台优先级的生命周期。
 - 多 turn 叙事切块、可重建 Episode、SessionEnd 收口和 session 生命周期保护。
 - Claude Code、Codex 的 hooks、MCP、Skills 安装器；通用 Agent 可使用 MCP、HTTP 或 hook wrapper。
-- 本地管理命令：检查、策略审批/撤销、遗忘、加密导入导出、重建索引和健康检查。
+- 本地管理命令：检查、策略审批/撤销、Curator、维护回滚、遗忘、加密导入导出、重建索引和健康检查。
 
 它不是云同步服务、多用户服务或能够自动理解所有事实和策略违规的通用裁判；默认 embedding 是本地确定性特征哈希，而不是外部基础模型。详见“[设计覆盖与实现状态](#设计覆盖与实现状态)”和“[MVP 边界](#mvp-边界)”。
 
 ## 设计覆盖与实现状态
 
-以下状态对照 [记忆架构.md](记忆架构.md) 与 [记忆架构讨论原文.md](记忆架构讨论原文.md) 核查当前 `0.1.0` 实现。结论是：**在线控制、门控混合检索和安全的慢速学习闭环均已落地；学习得到的行为 Policy 刻意保留人工审批门。**
+以下状态对照 [记忆架构.md](记忆架构.md)、[记忆架构讨论原文.md](记忆架构讨论原文.md) 以及持续增长场景核查当前 `0.1.0` 实现。结论是：**在线控制、证据门控、对象路由和安全学习闭环均已落地；记忆不再依赖一个无限增长的平铺索引，Curator 会增量合并、拆分、重组、降温和归档。学习得到的行为 Policy 仍刻意保留人工审批门。**
 
 ### 已实现
 
@@ -76,24 +86,35 @@ flowchart TB
 | Re-experience pack | `memory_build_workset` / `reexperience` stage 从最近 20–50 个 completed turn 的窗口中，按 token budget 组合原始可见事件、完整历史 Episode、关键/情绪事件、纠错锚点和事实约束；Episode 原子选择，不切断原文范围。 |
 | 叙事切块与 session 生命周期 | [src/core/narrative.ts](src/core/narrative.ts) 依据 session、时间间隔、任务类型、纠错、实体/主题变化、显式边界和大小限制合并或切分多 turn Episode；SessionEnd 关闭当前片段并阻止结束后的 session 再 begin，`reindex` 可从权威事件/trace 重建。 |
 | 后台慢速层 | daemon 按 `MEMORYD_LEARNING_INTERVAL_MS` 处理持久化、可重试的 learning job；`memoryctl learn --once` 可手工触发，`memoryctl inspect --all` 可审阅 cluster、Trigger、Calibration 和队列状态。 |
+| Raw / Episode / Semantic / Object 分层 | `SourceEvent` 是不可被摘要替代的 Raw Evidence；Episode 保留完整情境与 `eventRefs`；WorldClaim 保存 confidence、版本和冲突；Memory Object 把局部主题/实体组织成有界工作集。 |
+| 动态 Memory Object 与知识图 | [src/curator.ts](src/curator.ts) 用稳定 ID 创建、attach、merge、split 和 rename 对象；原节点不删除，`MemoryRelation` 支持 `part_of` 等九类边，`MemoryVersion` 保存算法与 before/after。 |
+| 分区和有界索引 | workspace 根分区超过 capacity 后变为 router，对象迁入 adaptive 子分区；session 事实使用独立 ACL 分区；对象热路径只读取命中叶分区的有限行，不填充全局 Object FTS；candidate、fan-out、depth、node/member/child/entity 阈值全部来自配置。 |
+| Risk-driven staged retrieval | `retrieveMemory()` 先分析 query 与记忆风险，再路由 Object/Partition，按 object → episode/semantic → raw 展开；事实/原话/冲突问题要求 Raw Evidence，证据不足返回 `shouldAbstain`。 |
+| Hot/Warm/Cold/Archive | [src/core/evolution.ts](src/core/evolution.ts) 综合访问、提及、显式记住、项目状态和时间计算温度；cold 仅精确命中，archive 明确 opt-in，归档不删除。 |
+| Curator job、审计与回滚 | `maintenance_jobs/actions` 提供幂等、lease、指数退避、dry-run 和 audit；merge/split/rename/move/summary/temperature 可回滚，恢复时创建单调递增的 `restore` 版本。 |
+| 质量与完整性 | 持久化 retrieval samples、子主题簇、query-hit dispersion、summary fidelity、local-use ratio、precision/recall proxy、evidence coverage、contradiction/stale/orphan rate 和 backlog；Curator 将这些信号用于摘要刷新、拆分建议和质量观测。 |
+| Schema v7 与渐进迁移 | v6→v7 只新增 scope registry、对象图、生命周期、retrieval trace 和维护表，不重写 Raw Evidence；加密 export/import 带上对象、关系、版本和温度，派生索引可重建。 |
 
 ### 安全约束与剩余边界
 
 - 学习出的 Policy 不会自动获得行为权威；candidate 仍须 `memoryctl approve`，审批同时检查纠错阈值和 dependency cycle。批准/撤销会同步激活/退休关联 Trigger。
 - 默认 embedding 是经过秘密过滤的本地 hash-ngram 向量；没有联网语义模型、ANN 服务或第三方原文上传。索引为空或 provider 不可用时，检索会重分配可用信号权重。
+- Curator 当前使用确定性实体防混淆、局部相似度和稳定分桶，不调用外部 LLM；因此可审计、可重放，但不会自动发现任意隐含关系或完成开放域语义聚类。
 - SessionEnd 不物理删除 session Policy；它结束 session、关闭叙事片段并让该 scope 不再用于新 turn。需要内容删除时仍须显式 `forget`。
 - 自动事实抽取、完整语义 verifier、连续同步和不互信多用户隔离仍不在当前实现范围内。
 
-**一句话总结：**“危险识别 → 模式切换 → 门控混合检索 → 原文工作集 → 验证 → 纠错 → shadow/replay 学习”已经形成可运行闭环；人类仍掌握学习 Policy 的最终行为授权。
+**一句话总结：**“危险识别 → 模式切换 → 对象路由 → 局部检索 → Raw Evidence → 验证 → 纠错”与“增量 ingest → merge/split/reorganize → 温度/归档 → 质量审计”已经形成两条可运行闭环；人类仍掌握学习 Policy 的最终行为授权。
 
 ## 运行结构
 
 ```mermaid
 flowchart TD
     CC["Claude Code"] & CX["Codex"] & AG["其他 Agent"] --> HK["Hooks + Skills + MCP (stdio)"]
-    HK -->|"HTTP · 127.0.0.1:7337"| D["memoryd daemon<br/>Risk + Trigger → TurnPlan → Gate → Hybrid Recall → Verifier"]
+    HK -->|"HTTP · 127.0.0.1:7337"| D["memoryd daemon<br/>Risk → Gate → Object Route → Evidence → Verifier"]
     D --> LW["learning worker<br/>shadow / replay"]
-    D --> DB[("SQLite WAL + FTS5 + 本地向量<br/>AES-256-GCM 加密")]
+    D --> CU["Memory Curator<br/>merge / split / lifecycle / audit"]
+    D --> DB[("SQLite WAL + FTS5 + 本地向量<br/>Object Graph + AES-256-GCM")]
+    CU --> DB
     D <-.->|"import / export（可选）"| OB["Obsidian vault<br/>人类可读抄本"]
 ```
 
@@ -162,6 +183,23 @@ memoryctl install all --scope user
 | `MEMORYD_RISK_CLASSIFIER_URL` | 未设置 | 可选 HTTP 风险分类器 URL |
 | `MEMORYD_RISK_CLASSIFIER_TOKEN` | 未设置 | 分类器 Bearer token |
 | `MEMORYD_LEARNING_INTERVAL_MS` | `5000` | daemon 慢速学习队列轮询间隔；最小 1000 ms |
+| `MEMORYD_CURATOR_INTERVAL_MS` | `15000` | maintenance queue 轮询间隔；每个 workspace 的 periodic scan 按小时幂等 |
+| `MEMORYD_MAX_NODE_TOKENS` | `1800` | Object 摘要/路由节点 token 上界信号 |
+| `MEMORYD_MAX_OBJECT_MEMBERS` / `TARGET_OBJECT_MEMBERS` | `24` / `12` | 触发 split 的成员上界与子对象目标大小 |
+| `MEMORYD_MAX_CHILD_COUNT` / `MAX_ENTITIES_PER_OBJECT` | `32` / `12` | 分区/对象 fan-out 与实体混杂上界 |
+| `MEMORYD_MAX_CANDIDATE_COUNT` / `MAX_ROUTED_OBJECTS` | `80` / `8` | 全阶段候选上界与首阶段路由对象上界 |
+| `MEMORYD_MAX_EXPANSION_DEPTH` | `3` | 对象图局部展开深度上界 |
+| `MEMORYD_SPLIT_MIN_MEMBERS` / `MERGE_SIMILARITY` | `6` / `0.78` | 自动 split 最低样本和自动 merge 相似度阈值 |
+| `MEMORYD_MIN_PRECISION_PROXY` / `MIN_RECALL_PROXY` / `MIN_EVIDENCE_COVERAGE` | `0.55` / `0.55` / `0.65` | 检索质量与事实证据阈值 |
+| `MEMORYD_MIN_SUBTOPIC_CLUSTERS` / `MAX_QUERY_HIT_DISPERSION` | `2` / `0.70` | 子主题分化和跨对象命中分散的 split 信号 |
+| `MEMORYD_MIN_SUMMARY_FIDELITY` / `MIN_LOCAL_USE_RATIO` / `MIN_RETRIEVAL_SAMPLES` | `0.45` / `0.20` / `5` | 摘要失真、局部实际使用率及检索信号最低样本 |
+| `MEMORYD_MAX_CONTRADICTION_RATE` / `MAX_STALE_SUMMARY_RATE` / `MAX_ORPHAN_RATE` | `0.25` / `0.20` / `0.05` | Curator 质量告警阈值 |
+| `MEMORYD_MAX_MAINTENANCE_BACKLOG` | `1000` | maintenance backlog 质量阈值 |
+| `MEMORYD_HOT_THRESHOLD` / `WARM_THRESHOLD` / `COLD_THRESHOLD` | `0.70` / `0.35` / `0.12` | Temperature tier 分界 |
+| `MEMORYD_COLD_AFTER_DAYS` / `ARCHIVE_AFTER_DAYS` | `90` / `365` | 长期未活动记忆降温/归档时间 |
+| `MEMORYD_STALE_SUMMARY_AFTER_DAYS` | `30` | summary refresh 的陈旧信号 |
+| `MEMORYD_CURATOR_BATCH_SIZE` / `MAINTENANCE_LEASE_MS` / `MAINTENANCE_MAX_ATTEMPTS` | `50` / `60000` / `5` | 增量批次、lease 和重试上限 |
+| `MEMORYD_SUMMARY_MAX_CHARACTERS` | `1200` | 确定性 locator summary 字符上界 |
 
 直接把 `MemoryStore` 当库使用且未传 `encryptionKey` 时，还支持 `MEMORYD_ENCRYPTION_KEY`；daemon 本身始终从 `MEMORYD_KEY` 指向的文件加载密钥。
 
@@ -208,10 +246,10 @@ Claude/Codex 的三个同名 Skill 目录会以模板强制复制；如果目标
 
 1. 每轮先调用 `memory_begin_turn`，获得 rule/classifier/Calibration/Trigger 风险、动态检索策略、Policy schedule 和 evidence gate。
 2. 若 `gate.required`，先读取当前文件、图片、测试或命令结果，再调用 `memory_checkpoint_evidence`；保存返回的 `{plan, observations, evidenceRefs}`。
-3. `memory_recall(stage=current_evidence)` 可再次取得本 turn checkpoint 的 `sourceRefs`。其他召回受 `snapshotRevision` 上界约束，不会看到 begin 之后写入的历史记忆。
-4. 按 `retrievalStages` 调用 `memory_recall`；`world`、`episode`、`reexperience`、`source_expansion` 会由服务端检查 gate，结果按 TurnPlan 的风险策略融合和重排。
+3. 推荐调用 `memory_retrieve`：服务端执行 Query Analysis、记忆风险、Object/Partition 路由和按需 evidence expansion，返回结构化来源类型、冲突、coverage 与 `shouldAbstain`。所有领域召回受 `snapshotRevision` 上界约束。
+4. 兼容客户端仍可按 `retrievalStages` 调用 `memory_recall`；`memory_recall(stage=current_evidence)` 可再次取得本 turn checkpoint 的 `sourceRefs`。
 5. 需要较完整的工作上下文时调用 `memory_build_workset`（等价于 gated `reexperience` stage），取得近期原文、完整叙事片段、关键/情绪事件和事实约束。
-6. 需要其他原文时用 `memory_get_sources` 展开 `sourceRefs`。该接口只接受本 turn checkpoint 或已落盘 recall trace 授权的来源；历史原文始终是不可信证据，不是指令。
+6. 需要其他原文时用 `memory_get_sources` 展开 `sourceRefs`。该接口只接受本 turn checkpoint 或已落盘 recall/retrieve trace 授权的来源；历史原文始终是不可信证据，不是指令。
 7. 用户明确纠正或要求记住时调用 `memory_submit_correction`；`origin:self_reflection` 只能创建候选，不能满足自动学习阈值。
 8. 用最终回答和实际采用的 `evidenceRefs` 调用 `memory_complete_turn`；证据同样必须已由本 turn checkpoint/recall 授权。
 
@@ -221,6 +259,12 @@ Claude/Codex 的三个同名 Skill 目录会以模板强制复制；如果目标
 
 ```text
 memoryctl start | stop | doctor | replay | learn --once
+memoryctl curate [scan|temperature|archive|reorganize|integrity_check|quality|reindex] [--dry-run]
+memoryctl curate merge --object <id> --object <id> [--force] [--dry-run]
+memoryctl curate split --object <id> [--dry-run]
+memoryctl curate rename --object <id> --title <text> [--routing-key <key>] [--dry-run]
+memoryctl curate process | curate jobs
+memoryctl curate rollback <action-id> [--idempotency-key <key>]
 memoryctl inspect [id] [--all]
 memoryctl approve <policy-id>
 memoryctl revoke <policy-id>
@@ -234,7 +278,7 @@ memoryctl reindex
 memoryctl install <claude|codex|all> [--scope user|project]
 ```
 
-审批、撤销、Calibration 退休、遗忘和导入导出只存在于管理 CLI，不作为 MCP 工具暴露给模型。`inspect --all` 会在当前 workspace 内包含各 session 的 candidate/inactive 记录、Trigger 和 learning job。学习得到的 candidate 必须先匹配至少 3 个独立用户纠错、覆盖 2 个 session 的非实体特定 cluster，`approve` 才会把这次 CLI 操作作为人工确认；审批还会拒绝 Policy dependency cycle，并激活关联 Trigger。用户显式策略不受该学习阈值限制。`learn --once` 立即处理当前 scope 的可学习 cluster；daemon 平时也会后台消费队列。`forget` 接受实体类型和 `inspect` 返回的稳定公开 ID；普通策略停用优先使用 `revoke`。删除会移除权威内容、FTS、embedding bucket、实体关系和关联派生记录，并留下不含被删内容的 tombstone。遗忘带来源的 claim、Policy、Episode、correction 或 observation 时会同时删除其原始 SourceEvent；遗忘 SourceEvent 时则反向删除所有引用它的记忆、turn/trace 和索引。WorldClaim 或 Policy 的公开 ID 被遗忘时会删除该身份的全部版本，避免历史内容残留或旧版本重新生效。该级联以隐私完整性优先，可能删除共享同一来源的其他派生记忆。
+审批、撤销、Calibration 退休、Curator、遗忘和导入导出只存在于管理 CLI，不作为 MCP 工具暴露给模型。`inspect --all` 会在当前 workspace 内包含对象、分区、温度、冲突、维护队列/audit，以及各 session 的 candidate/inactive 记录、Trigger 和 learning job。`curate scan --dry-run` 可先审阅建议；merge/split/rename/move 等可逆 action 用 `curate rollback` 恢复，恢复本身会写新的版本而不会倒退历史。学习得到的 candidate 必须先匹配至少 3 个独立用户纠错、覆盖 2 个 session 的非实体特定 cluster，`approve` 才会把这次 CLI 操作作为人工确认；审批还会拒绝 Policy dependency cycle，并激活关联 Trigger。用户显式策略不受该学习阈值限制。`learn --once` 立即处理当前 scope 的可学习 cluster；daemon 平时也会后台消费队列。`forget` 接受实体类型和 `inspect` 返回的稳定公开 ID；普通策略停用优先使用 `revoke`。删除会移除权威内容、Object/Relation/Version、FTS、embedding bucket、实体关系和关联派生记录，并留下不含被删内容的 tombstone。遗忘带来源的 claim、Policy、Episode、correction 或 observation 时会同时删除其原始 SourceEvent；遗忘 SourceEvent 时则反向删除所有引用它的记忆、turn/trace 和索引。WorldClaim 或 Policy 的公开 ID 被遗忘时会删除该身份的全部版本，避免历史内容残留或旧版本重新生效。该级联以隐私完整性优先，可能删除共享同一来源的其他派生记忆。
 
 不提供 passphrase 的导出由本地主密钥加密，通常只适合相同密钥环境；跨设备传输应显式提供高熵 passphrase。当前 passphrase 直接归一化为 AES key，没有使用 password-hard KDF。
 
@@ -262,7 +306,7 @@ SQLite 仍是唯一权威存储；vault 只是输入设备和人类可读视图�
 
 ## 降级行为
 
-hook 无法连接 daemon 时会允许 Agent 继续工作，并在 SessionStart/UserPromptSubmit 返回“记忆不可用，不得声称已召回”的提示；其他 hook 静默返回。失败事件进入加密、逐文件的幂等队列；后续成功的 SessionStart 或 `memoryctl replay` 会顺序补写。learning job 有 daemon 后台 worker 和失败重试；hook failure spool 仍没有后台退避、损坏条目隔离或自动清理。
+hook 无法连接 daemon 时会允许 Agent 继续工作，并在 SessionStart/UserPromptSubmit 返回“记忆不可用，不得声称已召回”的提示；其他 hook 静默返回。失败事件进入加密、逐文件的幂等队列；后续成功的 SessionStart 或 `memoryctl replay` 会顺序补写。learning/maintenance job 有 daemon 后台 worker、lease 和失败重试；hook failure spool 仍没有后台退避、损坏条目隔离或自动清理。
 
 可选风险 classifier 超时或失败时，确定性规则继续运行。`MemoryClient` 默认 HTTP 超时为 2 秒；MCP 和 hooks 通过它访问 daemon。
 
@@ -275,7 +319,7 @@ hook 无法连接 daemon 时会允许 Agent 继续工作，并在 SessionStart/U
 - 连续或云端同步、设备间冲突合并、workspace identity 重映射；只有加密导入导出和 tombstone。
 - 后台持续 hook spool replay、退避调度和损坏条目的自动隔离；当前只在 SessionStart 或显式 CLI 调用时顺序重放。慢速 learning job 是独立队列，不等同于 hook replay。
 - 从任意对话自动抽取结构化事实；WorldClaim 和 Policy 主要来自显式 correction。Episode 会自动叙事切块，但摘要/主题仍是确定性启发式，不是通用语义摘要器。
-- 外部神经 embedding 服务、通用 ANN 向量库和完整知识图谱推理；当前是本地 hash-ngram embedding、bucket 候选和一跳实体关系/owner 索引。
+- 外部神经 embedding 服务、通用 ANN 向量库、自动关系抽取和任意深度知识图推理；当前是一等 MemoryRelation/Object 图、本地 hash-ngram embedding、bucket 候选和有界局部遍历。
 - 完整语义 verifier。内置 verifier 会检测少量“声称记得但没有证据”的表达，并合并外部 `verifierResult` 报告的问题；外部状态只能收紧结果，不能用 `pass` 绕过 deterministic floor。
 - 强隔离的多用户服务、远程 TLS、密钥轮换和后台备份。
 
@@ -290,7 +334,7 @@ pnpm build
 pnpm bench
 ```
 
-测试覆盖协议、存储、runtime、适配器、学习、检索、embedding 和叙事切块。benchmark 默认写入 10 万条临时事件并报告 preflight/recall p95，同时显示目标值；目标值不是在所有机器上的性能保证。可用 `MEMORYD_BENCH_EVENTS` 和 `MEMORYD_BENCH_ITERATIONS` 调整规模。
+测试覆盖协议、存储、runtime、适配器、学习、检索、embedding、叙事切块，以及对象聚合、证据追溯、自动/显式 split、质量信号、merge/rename rollback、温度重激活、session ACL、增量回填无饥饿、冲突、Curator 重试、分区重组、v6→v7 migration、导入导出和 forget 级联。benchmark 默认写入 10 万条临时事件并报告 preflight/recall p95，同时显示目标值；目标值不是在所有机器上的性能保证。可用 `MEMORYD_BENCH_EVENTS` 和 `MEMORYD_BENCH_ITERATIONS` 调整规模。
 
 协议 JSON Schema 位于 `schemas/memory-protocol-v1.schema.json`。设计背景见 `记忆架构.md` 与 `记忆架构讨论原文.md`。
 

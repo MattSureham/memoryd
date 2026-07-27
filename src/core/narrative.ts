@@ -741,6 +741,9 @@ export function rebuildNarrativeEpisodes(
     if (previous !== undefined && result.decision.action === "merge") {
       episodes[episodes.length - 1] = result.episode;
     } else {
+      if (previous !== undefined && result.closedPrevious !== undefined) {
+        episodes[episodes.length - 1] = result.closedPrevious;
+      }
       episodes.push(result.episode);
     }
   }

@@ -186,7 +186,13 @@ export function buildDynamicRetrievalStrategy(
   };
 }
 
-export type RetrievalCandidateKind = "source_event" | "world_claim" | "episode" | "policy" | "correction";
+export type RetrievalCandidateKind =
+  | "source_event"
+  | "world_claim"
+  | "episode"
+  | "policy"
+  | "correction"
+  | "memory_object";
 
 export interface RetrievalCandidate<T = unknown> {
   id: string;
@@ -408,6 +414,7 @@ const RETRIEVAL_CANDIDATE_KINDS = new Set<RetrievalCandidateKind>([
   "episode",
   "policy",
   "correction",
+  "memory_object",
 ]);
 
 function encodeCursor(payload: CursorPayload): string {

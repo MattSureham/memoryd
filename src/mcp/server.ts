@@ -9,6 +9,7 @@ import type {
   CompleteTurnInput,
   CorrectionInput,
   RecallInput,
+  RetrieveMemoryInput,
 } from "../contracts.js";
 import { ProtocolError } from "../contracts.js";
 import { clientFromEnvironment, type MemoryClient } from "../client.js";
@@ -113,6 +114,28 @@ function registerTools(server: McpServer, client: MemoryClient): void {
     async (input) => {
       try {
         return result(await client.recall(input as RecallInput));
+      } catch (error) {
+        return failure(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "memory_retrieve",
+    {
+      description:
+        "Run bounded object/partition routing, local recall, and risk-driven evidence expansion. Returns direct evidence, derived memory, contradictions, coverage, and shouldAbstain separately.",
+      inputSchema: {
+        turnId: z.string().min(1),
+        query: z.string(),
+        budgetTokens: z.number().int().positive().max(8_000).optional(),
+        limit: z.number().int().positive().max(80).optional(),
+        includeArchive: z.boolean().optional(),
+      },
+    },
+    async (input) => {
+      try {
+        return result(await client.retrieveMemory(input as RetrieveMemoryInput));
       } catch (error) {
         return failure(error);
       }

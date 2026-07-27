@@ -98,6 +98,42 @@ export const RecallSchema = z.object({
   recentTurns: z.number().int().min(20).max(50).optional(),
 });
 
+export const RetrieveMemorySchema = z.object({
+  turnId: z.string().min(1),
+  query: z.string(),
+  budgetTokens: z.number().int().positive().max(8_000).optional(),
+  limit: z.number().int().positive().max(80).optional(),
+  includeArchive: z.boolean().optional(),
+});
+
+export const MaintenanceJobTypeSchema = z.enum([
+  "scan",
+  "ingest",
+  "merge",
+  "split",
+  "rename",
+  "reorganize",
+  "refresh_summary",
+  "temperature",
+  "archive",
+  "reindex",
+  "integrity_check",
+  "quality",
+]);
+
+export const RunMaintenanceSchema = z.object({
+  scope: ScopeSchema,
+  type: MaintenanceJobTypeSchema.optional(),
+  dryRun: z.boolean().optional(),
+  payload: z.record(z.string(), z.unknown()).optional(),
+  idempotencyKey: z.string().min(1),
+});
+
+export const RollbackMaintenanceSchema = z.object({
+  actionId: z.string().min(1),
+  idempotencyKey: z.string().min(1),
+});
+
 export const BuildWorksetSchema = z.object({
   turnId: z.string().min(1),
   query: z.string(),

@@ -1,6 +1,7 @@
 export * from "./budget.js";
 export * from "./features.js";
 export * from "./embedding.js";
+export * from "./evolution.js";
 export * from "./learning.js";
 export * from "./mode.js";
 export * from "./narrative.js";

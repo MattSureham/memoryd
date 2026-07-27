@@ -20,25 +20,28 @@ describe("localhost API", () => {
       deviceId: "http-device",
       learningIntervalMs: 5_000,
     };
-    const server = createMemoryHttpServer(new MemoryRuntime(store), config);
+    const runtime = new MemoryRuntime(store);
+    const server = createMemoryHttpServer(runtime, config);
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
     const address = server.address();
     if (address === null || typeof address === "string") throw new Error("Expected TCP address");
     const client = new MemoryClient({ baseUrl: `http://127.0.0.1:${address.port}`, token: "test-token" });
     try {
-      expect((await client.health()).protocolVersion).toBe("1.1");
+      expect((await client.health()).protocolVersion).toBe("1.2");
       const handshake = await fetch(`http://127.0.0.1:${address.port}/v1/handshake`, {
         method: "POST",
         headers: { authorization: "Bearer test-token" },
       });
       expect(await handshake.json()).toMatchObject({
-        protocolVersion: "1.1",
+        protocolVersion: "1.2",
         supports: {
           hybridRetrieval: true,
           reexperienceWorkset: true,
           triggerLearning: true,
           sessionLifecycle: true,
+          objectRoutedRetrieval: true,
+          dynamicMemoryCurator: true,
         },
       });
       const invalid = await fetch(`http://127.0.0.1:${address.port}/v1/turns/begin`, {
@@ -64,6 +67,29 @@ describe("localhost API", () => {
         evidenceRefs: [],
       });
       expect(completed.verifier.status).toBe("pass");
+      runtime.processMaintenanceJobs(10);
+
+      const retrievalPlan = await client.beginTurn({
+        input: { idempotencyKey: "http-retrieve", kind: "user_message", content: "Analyze the previous code" },
+        scope: { userId: "u", workspaceId: "w", sessionId: "retrieve-session" },
+        agentProfile: { family: "mock", version: "1", capabilities: { hooks: true, stageGates: true } },
+      });
+      if (retrievalPlan.gate.required) {
+        await client.checkpointEvidence({
+          turnId: retrievalPlan.turnId,
+          observations: [{ kind: "current_file", content: "The current source tree is available for comparison." }],
+        });
+      }
+      const retrieval = await client.retrieveMemory({
+        turnId: retrievalPlan.turnId,
+        query: "Analyze the previous code",
+      });
+      expect(retrieval).toMatchObject({
+        protocolVersion: "1.2",
+        shouldAbstain: false,
+        trace: { routedObjectIds: expect.any(Array) },
+      });
+      expect(retrieval.memories).not.toHaveLength(0);
 
       const worksetPlan = await client.beginTurn({
         input: { idempotencyKey: "http-workset", kind: "user_message", content: "Summarize the notes" },

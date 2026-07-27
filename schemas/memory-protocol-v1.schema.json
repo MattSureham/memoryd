@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://memoryd.local/schema/memory-protocol-v1.schema.json",
-  "title": "memoryd protocol v1.1",
+  "title": "memoryd protocol v1.2",
   "description": "Canonical request and response types shared by MCP, HTTP and CLI adapters.",
   "$defs": {
     "ScopeRef": {
@@ -231,9 +231,10 @@
       "additionalProperties": false,
       "required": ["protocolVersion", "turnId", "snapshotRevision", "agentProfileKey", "risks", "modes", "retrievalStages", "gate", "activePolicies", "enforcementLevel", "retryCount", "createdAt"],
       "properties": {
-        "protocolVersion": { "const": "1.1" },
+        "protocolVersion": { "const": "1.2" },
         "turnId": { "type": "string" },
         "snapshotRevision": { "type": "integer", "minimum": 0 },
+        "memoryGeneration": { "type": "integer", "minimum": 0 },
         "agentProfileKey": { "type": "string" },
         "risks": { "type": "array", "items": { "$ref": "#/$defs/RiskScore" } },
         "modes": {
@@ -327,6 +328,11 @@
         "conflictGroup": { "type": "string" },
         "sources": { "type": "array", "items": { "$ref": "#/$defs/SourceRef" } },
         "version": { "type": "integer", "minimum": 1 }
+        ,"firstSeenAt": { "type": "string", "format": "date-time" }
+        ,"lastConfirmedAt": { "type": "string", "format": "date-time" }
+        ,"schemaVersion": { "type": "integer", "minimum": 1 }
+        ,"embeddingVersion": { "type": "string" }
+        ,"provenance": { "type": "object" }
       }
     },
     "EpisodeMemory": {
@@ -347,7 +353,13 @@
         "topicKey": { "type": "string" },
         "boundaryReason": { "enum": ["new_session", "topic_shift", "correction", "time_gap", "size_limit", "explicit"] },
         "salience": { "type": "number" },
-        "emotionTags": { "type": "array", "items": { "type": "string" } }
+        "emotionTags": { "type": "array", "items": { "type": "string" } },
+        "status": { "enum": ["active", "archived", "deprecated"] },
+        "schemaVersion": { "type": "integer", "minimum": 1 },
+        "embeddingVersion": { "type": "string" },
+        "summarizerVersion": { "type": "string" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "provenance": { "type": "object" }
       }
     },
     "MemoryReexperiencePack": {
@@ -398,7 +410,7 @@
       "additionalProperties": false,
       "required": ["protocolVersion", "turnId", "snapshotRevision", "indexRevision", "stage", "worldClaims", "episodes", "sourceRefs", "policies", "counterexamples", "conflicts", "sourceCoverage", "trace", "untrustedEvidenceNotice"],
       "properties": {
-        "protocolVersion": { "const": "1.1" },
+        "protocolVersion": { "const": "1.2" },
         "turnId": { "type": "string" },
         "snapshotRevision": { "type": "integer", "minimum": 0 },
         "indexRevision": { "type": "integer", "minimum": 0 },
@@ -440,6 +452,159 @@
             "coverageReranked": { "type": "boolean" }
           }
         },
+        "untrustedEvidenceNotice": { "type": "string" }
+      }
+    },
+    "MemoryRiskProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["factualRecall", "quoteRecall", "entityConfusion", "temporalConfusion", "contradictionRisk", "narrativeCompletionRisk", "lowEvidenceRisk", "inferenceAllowed", "retrievalDepth", "topK", "confidenceLanguage"],
+      "properties": {
+        "factualRecall": { "type": "boolean" },
+        "quoteRecall": { "type": "boolean" },
+        "entityConfusion": { "type": "boolean" },
+        "temporalConfusion": { "type": "boolean" },
+        "contradictionRisk": { "type": "boolean" },
+        "narrativeCompletionRisk": { "type": "boolean" },
+        "lowEvidenceRisk": { "type": "boolean" },
+        "inferenceAllowed": { "type": "boolean" },
+        "retrievalDepth": { "enum": ["object", "episode", "raw"] },
+        "topK": { "type": "integer", "minimum": 1 },
+        "confidenceLanguage": { "enum": ["normal", "qualified", "strict"] }
+      }
+    },
+    "MemoryQueryAnalysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entities", "topics", "temporalHints", "taskType", "explicitArchiveLookup"],
+      "properties": {
+        "entities": { "type": "array", "items": { "type": "string" } },
+        "topics": { "type": "array", "items": { "type": "string" } },
+        "temporalHints": { "type": "array", "items": { "type": "string" } },
+        "taskType": { "enum": ["factual_recall", "quote_recall", "analysis", "general"] },
+        "explicitArchiveLookup": { "type": "boolean" }
+      }
+    },
+    "MemoryRetrievalItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["memoryId", "memoryType", "content", "score", "confidence", "evidenceRefs", "sourceType"],
+      "properties": {
+        "memoryId": { "type": "string" },
+        "memoryType": { "enum": ["raw", "episode", "semantic", "object"] },
+        "content": { "type": "string" },
+        "score": { "type": "number" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "evidenceRefs": { "type": "array", "items": { "$ref": "#/$defs/SourceRef" } },
+        "sourceType": { "enum": ["direct", "derived", "inferred", "unresolved_contradiction"] },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "contradictions": { "type": "array", "items": { "type": "string" } },
+        "objectId": { "type": "string" },
+        "partitionId": { "type": "string" }
+      }
+    },
+    "Contradiction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contradictionId", "scope", "oldClaim", "newClaim", "evidenceRefs", "status", "version", "createdAt", "updatedAt"],
+      "properties": {
+        "contradictionId": { "type": "string" },
+        "scope": { "$ref": "#/$defs/ScopeRef" },
+        "oldClaim": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["claimId", "version", "confidence"],
+          "properties": {
+            "claimId": { "type": "string" },
+            "version": { "type": "integer", "minimum": 1 },
+            "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        },
+        "newClaim": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["claimId", "version", "confidence"],
+          "properties": {
+            "claimId": { "type": "string" },
+            "version": { "type": "integer", "minimum": 1 },
+            "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        },
+        "evidenceRefs": { "type": "array", "items": { "$ref": "#/$defs/SourceRef" } },
+        "currentPreferredClaim": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["claimId", "version"],
+          "properties": {
+            "claimId": { "type": "string" },
+            "version": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "status": { "enum": ["unresolved", "resolved", "temporal", "coexisting"] },
+        "resolutionReason": { "type": "string" },
+        "validFrom": { "type": "string", "format": "date-time" },
+        "validTo": { "type": "string", "format": "date-time" },
+        "version": { "type": "integer", "minimum": 1 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "RetrievalTrace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["retrievalId", "turnId", "scope", "query", "strategy", "riskProfile", "analysis", "routedPartitionIds", "routedObjectIds", "returnedMemoryIds", "returnedObjectIds", "stages", "candidateCount", "returnedCount", "expansionDepth", "evidenceCoverage", "shouldAbstain", "createdAt"],
+      "properties": {
+        "retrievalId": { "type": "string" },
+        "turnId": { "type": "string" },
+        "scope": { "$ref": "#/$defs/ScopeRef" },
+        "query": { "type": "string" },
+        "strategy": { "type": "string" },
+        "riskProfile": { "$ref": "#/$defs/MemoryRiskProfile" },
+        "analysis": { "$ref": "#/$defs/MemoryQueryAnalysis" },
+        "routedPartitionIds": { "type": "array", "items": { "type": "string" } },
+        "routedObjectIds": { "type": "array", "items": { "type": "string" } },
+        "returnedMemoryIds": { "type": "array", "items": { "type": "string" } },
+        "returnedObjectIds": { "type": "array", "items": { "type": "string" } },
+        "stages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "candidateCount", "returnedCount", "durationMs"],
+            "properties": {
+              "name": { "enum": ["query_analysis", "risk", "route", "local_recall", "episode_expand", "raw_expand", "verify"] },
+              "candidateCount": { "type": "integer", "minimum": 0 },
+              "returnedCount": { "type": "integer", "minimum": 0 },
+              "durationMs": { "type": "number", "minimum": 0 }
+            }
+          }
+        },
+        "candidateCount": { "type": "integer", "minimum": 0 },
+        "returnedCount": { "type": "integer", "minimum": 0 },
+        "expansionDepth": { "type": "integer", "minimum": 0 },
+        "evidenceCoverage": { "type": "number", "minimum": 0, "maximum": 1 },
+        "shouldAbstain": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "MemoryRetrievalResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocolVersion", "retrievalId", "turnId", "query", "strategy", "riskProfile", "analysis", "memories", "unresolvedQuestions", "unresolvedContradictions", "evidenceCoverage", "shouldAbstain", "trace", "untrustedEvidenceNotice"],
+      "properties": {
+        "protocolVersion": { "const": "1.2" },
+        "retrievalId": { "type": "string" },
+        "turnId": { "type": "string" },
+        "query": { "type": "string" },
+        "strategy": { "type": "string" },
+        "riskProfile": { "$ref": "#/$defs/MemoryRiskProfile" },
+        "analysis": { "$ref": "#/$defs/MemoryQueryAnalysis" },
+        "memories": { "type": "array", "items": { "$ref": "#/$defs/MemoryRetrievalItem" } },
+        "unresolvedQuestions": { "type": "array", "items": { "type": "string" } },
+        "unresolvedContradictions": { "type": "array", "items": { "$ref": "#/$defs/Contradiction" } },
+        "evidenceCoverage": { "type": "number", "minimum": 0, "maximum": 1 },
+        "shouldAbstain": { "type": "boolean" },
+        "trace": { "$ref": "#/$defs/RetrievalTrace" },
         "untrustedEvidenceNotice": { "type": "string" }
       }
     },
@@ -513,6 +678,18 @@
         "budgetTokens": { "type": "integer", "minimum": 1, "maximum": 8000 },
         "cursor": { "type": "string" },
         "recentTurns": { "type": "integer", "minimum": 20, "maximum": 50 }
+      }
+    },
+    "RetrieveMemoryRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["turnId", "query"],
+      "properties": {
+        "turnId": { "type": "string" },
+        "query": { "type": "string" },
+        "budgetTokens": { "type": "integer", "minimum": 1, "maximum": 8000 },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 80 },
+        "includeArchive": { "type": "boolean" }
       }
     },
     "BuildWorksetRequest": {
@@ -592,6 +769,7 @@
     { "$ref": "#/$defs/CheckpointEvidenceRequest" },
     { "$ref": "#/$defs/CheckpointEvidenceResult" },
     { "$ref": "#/$defs/RecallRequest" },
+    { "$ref": "#/$defs/RetrieveMemoryRequest" },
     { "$ref": "#/$defs/BuildWorksetRequest" },
     { "$ref": "#/$defs/EndSessionRequest" },
     { "$ref": "#/$defs/GetSourcesRequest" },
@@ -599,6 +777,7 @@
     { "$ref": "#/$defs/CompleteTurnRequest" },
     { "$ref": "#/$defs/TurnPlan" },
     { "$ref": "#/$defs/MemoryBundle" },
+    { "$ref": "#/$defs/MemoryRetrievalResult" },
     { "$ref": "#/$defs/SourceEvent" }
   ]
 }
