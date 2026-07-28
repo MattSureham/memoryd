@@ -110,6 +110,9 @@ No participant may silently modify the protocol.
 | 2026-07-28 | `pnpm build` | Passed | **Confirmed** | `agent:codex/bootstrap` |
 | 2026-07-28 | `pnpm bench` | Not run during protocol initialization | **Unknown** | `agent:codex/bootstrap` |
 | 2026-07-28 | Real Claude Code/Codex end-to-end host exercise | Not run during protocol initialization | **Unknown** | `agent:codex/bootstrap` |
+| 2026-07-28 | `pnpm typecheck` | Passed (independent re-run at HEAD `e149e54`) | **Confirmed** | `agent:claude-code/validation-20260728` |
+| 2026-07-28 | `pnpm test` | 19 files passed; 136 tests passed (independent re-run at HEAD `e149e54`) | **Confirmed** | `agent:claude-code/validation-20260728` |
+| 2026-07-28 | `pnpm build` | Passed (independent re-run at HEAD `e149e54`) | **Confirmed** | `agent:claude-code/validation-20260728` |
 
 ## Active Issues
 
@@ -121,6 +124,7 @@ No participant may silently modify the protocol.
 - **Evidence:**
   - **Confirmed** — `MemoryRuntime.retrieveMemory()` persists authorized refs in a turn trace with `kind: "object_retrieval"` (`src/runtime.ts`). — `agent:codex/bootstrap`
   - **Confirmed** — `MemoryRuntime.assertTurnSourceAccess()` only reads traces whose kind is `"recall"` (`src/runtime.ts`). — `agent:codex/bootstrap`
+  - **Confirmed** — re-verified at HEAD `e149e54` (2026-07-28): `src/runtime.ts:2509` still reads `if (storedTrace.trace.kind !== "recall") continue;` inside `assertTurnSourceAccess()`, while `retrieveMemory()` persists `kind: "object_retrieval"` at `src/runtime.ts:1202`. The mismatch remains present. — `agent:claude-code/validation-20260728`
   - **Confirmed** — `README.md` documents the mismatch, while `docs/architecture.md` describes recall/retrieve traces as authorizing source expansion. — `agent:codex/bootstrap`
 - **Current resolution state:** No code change exists. Object retrieval returns raw items inline when selected; callers needing separate expansion must first use staged recall.
 
@@ -192,9 +196,29 @@ Add a regression test proving that only SourceRefs persisted in the same turn's 
 
 **Definition of done:** the new positive case passes, a negative cross-turn or untraced-ref case still returns `SCOPE_DENIED`, all existing tests pass, documentation describes the implemented behavior, and the completing participant records the evidence in `COL-001` plus a new Recent Activity entry.
 
+**Re-validated 2026-07-28** by `agent:claude-code/validation-20260728`: `COL-001` is still open at HEAD `e149e54` and this action remains the correct bounded successor.
+
 ## Recent Activity
 
 > Append new entries immediately below this note; newest entries remain first. Never edit another participant's entry except to correct an objectively invalid path, symbol, or commit reference, and record that correction in a new entry.
+
+### `ACT-2026-07-28-002` — Independently validate Current State at HEAD `e149e54`
+
+- **Participant:** `agent:claude-code/validation-20260728`
+- **Role:** Onboarding validator (second participant; prior context covers commits through `3100172`)
+- **Task:** Read `BOOTSTRAP.md`/`HANDOFF.md`, establish independent understanding, and validate **Current State** against repository evidence without restarting analysis. The assigned Role/Task fields in the request were empty, so this entry covers validation only.
+- **Context inspected:** `package.json`; `src/contracts.ts` (`PROTOCOL_VERSION`); `src/storage/schema.ts` (`SCHEMA_VERSION`); `src/runtime.ts` (`processLearningJobs`, `processMaintenanceJobs`, `assertTurnSourceAccess`, `retrieveMemory` trace kind); `src/curator.ts`; `src/core/evolution.ts`; `src/http/server.ts`; `src/mcp/server.ts`; `integrations/`; `README.md` section inventory and `:1250` "Known boundaries"; `git log 3100172..HEAD` (commits `b86b96c`, `0c1377a`, `1519895`, `1b49252`, `e149e54`); `.gitignore` (design notes now untracked).
+- **Actions performed:** validated every `CS-001`–`CS-008` claim against cited evidence; re-ran the recorded verification commands; appended attributed confirmation evidence to `COL-001`; appended independent verification rows; re-validated `NA-001` in place.
+- **Files modified:** `HANDOFF.md` only.
+- **Findings:**
+  - **Confirmed:** all eight Current State rows match repository evidence (package `0.1.0` private + Node 22 + pnpm 10.15.1; runtime surfaces; schema `7`; protocol `1.2`; Curator/learning timers; English default README + `README.zh-CN.md`; MVP boundaries; human approval gate).
+  - **Confirmed:** `COL-001` mismatch persists at `src/runtime.ts:2509` vs `:1202`.
+  - **Confirmed:** five commits landed between `3100172` and `e149e54`, including the adaptive self-evolving architecture (`b86b96c`: Memory Objects, Partitions, Curator, Hot/Warm/Cold/Archive, protocol 1.2 `memory_retrieve`, schema v7) and the HANDOFF initialization.
+  - **Confirmed:** `记忆架构.md` and `记忆架构讨论原文.md` were removed from Git tracking and added to `.gitignore` (`1b49252`); they still exist locally but are no longer citable as tracked repository evidence.
+- **Verification performed:** `pnpm typecheck` passed; `pnpm test` passed 19 files / 136 tests; `pnpm build` passed — all independently re-run on 2026-07-28 at HEAD `e149e54`.
+- **Issues created or updated:** appended confirmation evidence to `COL-001` (status unchanged, still Open, unassigned).
+- **Remaining uncertainty:** `pnpm bench` and real host end-to-end exercise remain **Unknown** (not run by this participant); the walkthrough sections appended to `README.md` (commit `0c1377a`) were inventoried by section heading only, not read in full.
+- **Recommended next action:** `NA-001` (unchanged; re-validated as still open and bounded).
 
 ### `ACT-2026-07-28-001` — Initialize persistent collaboration protocol
 
