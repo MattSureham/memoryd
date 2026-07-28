@@ -2506,6 +2506,11 @@ export class MemoryRuntime {
       if (observation.source?.eventId !== undefined) allowed.add(observation.source.eventId);
     }
     for (const storedTrace of this.store.listTraces(turn.turnId)) {
+      if (storedTrace.trace.kind === "object_retrieval") {
+        const refs = storedTrace.trace.sourceRefs as readonly SourceRef[] | undefined;
+        for (const ref of refs ?? []) allowed.add(ref.eventId);
+        continue;
+      }
       if (storedTrace.trace.kind !== "recall") continue;
       const bundle = storedTrace.trace.bundle as Partial<MemoryBundle> | undefined;
       if (bundle === undefined || bundle === null || typeof bundle !== "object") continue;

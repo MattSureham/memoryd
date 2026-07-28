@@ -84,7 +84,6 @@ No participant may silently modify the protocol.
 
 ### Unfinished or constrained
 
-- **Confirmed:** `getSources()` does not currently authorize evidence solely from a same-turn `object_retrieval` trace; see `COL-001`.
 - **Confirmed:** the package is private/unpublished and its root export includes low-level internals; see `COL-002`.
 - **Confirmed:** generic ANN, automatic arbitrary relation extraction, and a full semantic entailment verifier are absent; see `COL-003`.
 - **Confirmed:** strong multi-tenant authentication, built-in TLS, key rotation, automated backups, HA, and rate limiting are absent; see `COL-004`.
@@ -113,20 +112,27 @@ No participant may silently modify the protocol.
 | 2026-07-28 | `pnpm typecheck` | Passed (independent re-run at HEAD `e149e54`) | **Confirmed** | `agent:claude-code/validation-20260728` |
 | 2026-07-28 | `pnpm test` | 19 files passed; 136 tests passed (independent re-run at HEAD `e149e54`) | **Confirmed** | `agent:claude-code/validation-20260728` |
 | 2026-07-28 | `pnpm build` | Passed (independent re-run at HEAD `e149e54`) | **Confirmed** | `agent:claude-code/validation-20260728` |
+| 2026-07-28 | `pnpm typecheck` | Passed (after `COL-001` fix) | **Confirmed** | `agent:claude-code/validation-20260728` |
+| 2026-07-28 | `pnpm test` | 19 files passed; 138 tests passed, including 2 new `COL-001` regression tests (after fix) | **Confirmed** | `agent:claude-code/validation-20260728` |
+| 2026-07-28 | `pnpm build` | Passed (after `COL-001` fix) | **Confirmed** | `agent:claude-code/validation-20260728` |
 
 ## Active Issues
 
 ### `COL-001` — Object-retrieval source authorization mismatch
 
-- **Status:** Open
+- **Status:** Resolved
 - **Severity:** Medium
-- **Owner:** Unassigned
+- **Owner:** `agent:claude-code/validation-20260728` (claimed 2026-07-28; previously unassigned)
 - **Evidence:**
   - **Confirmed** — `MemoryRuntime.retrieveMemory()` persists authorized refs in a turn trace with `kind: "object_retrieval"` (`src/runtime.ts`). — `agent:codex/bootstrap`
   - **Confirmed** — `MemoryRuntime.assertTurnSourceAccess()` only reads traces whose kind is `"recall"` (`src/runtime.ts`). — `agent:codex/bootstrap`
   - **Confirmed** — re-verified at HEAD `e149e54` (2026-07-28): `src/runtime.ts:2509` still reads `if (storedTrace.trace.kind !== "recall") continue;` inside `assertTurnSourceAccess()`, while `retrieveMemory()` persists `kind: "object_retrieval"` at `src/runtime.ts:1202`. The mismatch remains present. — `agent:claude-code/validation-20260728`
   - **Confirmed** — `README.md` documents the mismatch, while `docs/architecture.md` describes recall/retrieve traces as authorizing source expansion. — `agent:codex/bootstrap`
-- **Current resolution state:** No code change exists. Object retrieval returns raw items inline when selected; callers needing separate expansion must first use staged recall.
+  - **Confirmed** — resolved 2026-07-28: `assertTurnSourceAccess()` now accepts same-turn traces with `kind === "object_retrieval"` and admits their persisted `sourceRefs` into the authorized set (`src/runtime.ts`, in the trace loop before the `"recall"` branch). Turn scoping is unchanged (`listTraces(turn.turnId)`), and scope ACLs remain enforced downstream by `store.getSourceEvents()`. — `agent:claude-code/validation-20260728`
+  - **Confirmed** — regression coverage added in `tests/evolving-memory.test.ts`: a positive same-turn case (`retrieveMemory()` refs expand through `getSources()`) and a negative cross-turn case (same refs on a different turn still throw `ProtocolError`/`SCOPE_DENIED`). — `agent:claude-code/validation-20260728`
+  - **Confirmed** — `pnpm test` passed 19 files / 138 tests after the fix (was 136). — `agent:claude-code/validation-20260728`
+  - **Confirmed** — documentation reconciled: `README.md` and `README.zh-CN.md` walkthrough, API table, and "Known boundaries" now state that `getSources()` recognizes checkpoint, staged `recall()`, and same-turn object-retrieval authorization; the boundary row describing the mismatch was removed. `docs/architecture.md:162` and `docs/protocol.md:243-245` already described the intended behavior and now match the code. — `agent:claude-code/validation-20260728`
+- **Current resolution state:** Fixed in code, covered by regression tests, and documented. Refs authorized by a same-turn `object_retrieval` trace can be expanded via `getSources()`; cross-turn and untraced refs remain denied.
 
 ### `COL-002` — Public SDK boundary is unstable
 
@@ -190,17 +196,35 @@ No participant may silently modify the protocol.
 
 ## Next Action
 
-### `NA-001` — Resolve `COL-001` without weakening source ACLs
+### `NA-002` — Draft the high-level SDK facade proposal for `COL-002`
 
-Add a regression test proving that only SourceRefs persisted in the same turn's `object_retrieval` trace can be expanded through `getSources()`, update `MemoryRuntime.assertTurnSourceAccess()` to recognize those refs while retaining turn and scope checks, reconcile the corresponding README/architecture statements, and run `pnpm typecheck && pnpm test && pnpm build`.
+Write a design proposal for one stable high-level SDK facade covering the turn lifecycle, conditional checkpoint, explicit fact confirmation, object retrieval/source expansion, and embedded-worker lifecycle, while marking low-level storage/core root exports as non-public. Per `README.md` section "Recommended next step", runtime code must not change until the API design is explicitly approved, so this action is limited to producing the proposal.
 
-**Definition of done:** the new positive case passes, a negative cross-turn or untraced-ref case still returns `SCOPE_DENIED`, all existing tests pass, documentation describes the implemented behavior, and the completing participant records the evidence in `COL-001` plus a new Recent Activity entry.
-
-**Re-validated 2026-07-28** by `agent:claude-code/validation-20260728`: `COL-001` is still open at HEAD `e149e54` and this action remains the correct bounded successor.
+**Definition of done:** the proposal names the facade's methods and their mapping to existing `MemoryRuntime`/`MemoryClient` calls, lists which current root exports become non-public, states compatibility with protocol 1.2, and is recorded for human approval (e.g. in `docs/` or an attributed Recent Activity entry). No runtime code changes.
 
 ## Recent Activity
 
 > Append new entries immediately below this note; newest entries remain first. Never edit another participant's entry except to correct an objectively invalid path, symbol, or commit reference, and record that correction in a new entry.
+
+### `ACT-2026-07-28-003` — Execute `NA-001`: resolve `COL-001`
+
+- **Participant:** `agent:claude-code/validation-20260728`
+- **Role:** Implementer (executing the bounded next action recorded in this file)
+- **Task:** `NA-001` — resolve `COL-001` without weakening source ACLs: make `getSources()` accept refs authorized by a same-turn `object_retrieval` trace, add regression tests, reconcile documentation, and verify.
+- **Context inspected:** `src/runtime.ts` (`retrieveMemory()` trace write at `:1198-1209`, `getSources()` at `:2055-2059`, `assertTurnSourceAccess()` at `:2499-2532`); `src/contracts.ts` (`MemoryRetrievalItem`, `MemoryRetrievalResult`, `ProtocolError`); `tests/evolving-memory.test.ts` (existing `retrieveMemory`/`beginQuery`/`addEpisode` patterns); `README.md` walkthrough/API table/Known boundaries; `README.zh-CN.md` corresponding sections; `docs/architecture.md:162`; `docs/protocol.md:243-245`.
+- **Actions performed:**
+  1. Extended the trace loop in `assertTurnSourceAccess()` (`src/runtime.ts`) to accept traces with `kind === "object_retrieval"` and admit their persisted `sourceRefs` event IDs into the authorized set, before the existing `"recall"` branch. Turn scoping unchanged (`listTraces(turn.turnId)`); scope ACLs still enforced downstream by `store.getSourceEvents()`.
+  2. Added two regression tests in `tests/evolving-memory.test.ts`: positive — refs from `retrieveMemory()` results expand through `getSources()` on the same turn; negative — the same refs requested on a different turn still throw `ProtocolError` (`SCOPE_DENIED`).
+  3. Reconciled docs: `README.md` and `README.zh-CN.md` walkthrough note, `getSources` API-table row, and "Known boundaries" (removed the now-fixed mismatch row; dropped the stale "inconsistent authorization" phrase from the recommended-next-step paragraph). `docs/architecture.md`/`docs/protocol.md` already described the intended behavior and needed no change.
+- **Files modified:** `src/runtime.ts`, `tests/evolving-memory.test.ts`, `README.md`, `README.zh-CN.md`, `HANDOFF.md`.
+- **Findings:**
+  - **Confirmed:** the fix is additive — the `"recall"` path, policy-source path, and observation path are untouched; only `object_retrieval` traces of the same turn add refs.
+  - **Confirmed:** the object-retrieval trace's `sourceRefs` derive from `selected` items' `evidenceRefs` (`src/runtime.ts:1198`), so raw items included in a factual/quote result are covered.
+  - **Confirmed:** test count went from 136 to 138 with the two new tests.
+- **Verification performed:** `pnpm typecheck` passed; `pnpm test` passed 19 files / 138 tests; `pnpm build` passed — all run on 2026-07-28 after the fix.
+- **Issues created or updated:** claimed and resolved `COL-001` (was unassigned); no new issues.
+- **Remaining uncertainty:** `pnpm bench` and real host end-to-end exercise remain **Unknown** (not run).
+- **Recommended next action:** `NA-002`.
 
 ### `ACT-2026-07-28-002` — Independently validate Current State at HEAD `e149e54`
 

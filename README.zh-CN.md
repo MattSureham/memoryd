@@ -644,7 +644,7 @@ node walkthrough-cats.mjs
 
 如果改问一个完全没有命中的事实，例如 `What is ProjectZephyr's launch code?`，当前实现会返回空或不足的候选、把原因放进 `unresolvedQuestions`，并令 `shouldAbstain: true`。调用方必须停止事实断言。需要注意，coverage 目前验证“引用能否解析”，不验证文本是否在语义上蕴含答案；没有完整 semantic verifier 时，调用方仍需检查返回内容是否真的支持结论。
 
-`retrieveMemory()` 已把高风险事实查询展开成 `raw` item，因此这个例子不需要再调用 `getSources()`。当前版本的 `getSources()` 只认可 checkpoint 或 staged `recall()` trace 的授权，不认可 object-retrieval trace；若要使用独立来源展开端点，应先调用 `recall({ stage: "source_expansion" })`，再把该 bundle 的 `sourceRefs` 传给 `getSources()`。
+`retrieveMemory()` 已把高风险事实查询展开成 `raw` item，因此这个例子不需要再调用 `getSources()`。`getSources()` 认可 checkpoint、staged `recall()` trace 以及同 turn object-retrieval trace 的授权，因此 `retrieveMemory()` 返回的 refs 也可以直接通过 `getSources()` 展开。
 
 ## 4. 端到端数据流
 
@@ -786,7 +786,7 @@ const client = new MemoryClient({
 | `retrieveMemory(input: RetrieveMemoryInput): Promise<MemoryRetrievalResult>` | 新集成首选检索；query、可选 1–8000 token、limit 1–80、archive opt-in | 写 retrieval trace 和 object access/temperature 统计 | `STAGE_BLOCKED`、turn/scope 错误 | `await client.retrieveMemory({ turnId, query })` |
 | `recall(input: RecallInput): Promise<MemoryBundle>` | 兼容/精细 staged flow；stage 必须来自 TurnPlan | 写 recall trace；reexperience 可能返回原文工作集 | `STAGE_BLOCKED`、stage 不存在、cursor 不匹配 | `await client.recall({ turnId, stage: "world", query })` |
 | `buildWorkset(input: BuildWorksetInput): Promise<MemoryBundle>` | 可选；等同 `reexperience` stage，recentTurns 被 clamp 到 20–50 | 写 recall trace | gate、budget/cursor 错误 | `await client.buildWorkset({ turnId, query, recentTurns: 20 })` |
-| `getSources(turnId, refs): Promise<SourceEvent[]>` | 可选；展开已授权 staged-recall/checkpoint/Policy refs，最多 50 | 无业务写入 | `SCOPE_DENIED`、hash/session 不匹配、not found | `await client.getSources(turnId, bundle.sourceRefs)` |
+| `getSources(turnId, refs): Promise<SourceEvent[]>` | 可选；展开已授权 staged-recall/checkpoint/Policy/object-retrieval refs，最多 50 | 无业务写入 | `SCOPE_DENIED`、hash/session 不匹配、not found | `await client.getSources(turnId, bundle.sourceRefs)` |
 | `recordEvent(input: RecordEventInput): Promise<SourceEvent>` | 可选 adapter API；不在 MCP 中；用于 hook 的工具/附件事件 | 写 SourceEvent 和派生索引；未选择的 tool body 被丢弃 | ended session、幂等/ACL 冲突 | `await client.recordEvent({ input, scope, agentProfile, selectedEvidence: true })` |
 | `submitCorrection(input: CorrectionInput): Promise<Record<string, unknown>>` | 可选但为事实/行为确认的公共入口 | 写 correction evidence、Correction；合格 fact 写 WorldClaim，behavior 写 Policy/candidate | turn/session、scope、幂等错误 | `await client.submitCorrection({ turnId, kind: "fact", correction, subject, predicate, value, explicit: true, idempotencyKey })` |
 | `completeTurn(input: CompleteTurnInput): Promise<CompleteTurnResult>` | **每轮必需**；最终可见回答、采用 refs、可选外部 verifier 报告 | 写 assistant SourceEvent、trace、turn 状态、Episode 和 jobs | 未授权 ref、不同 response 的重复完成、一次 retry 后 abstain/clarify | `await client.completeTurn({ turnId, response, evidenceRefs, idempotencyKey })` |
@@ -1268,7 +1268,6 @@ WHERE m.status = 'active'
 | 内置 TLS | server 只提供 HTTP。保持 loopback；远程访问必须放在 TLS 反向代理/隧道和网络 ACL 后面。 |
 | 自动事实抽取 | 普通用户陈述只进入 Raw/Episode。只有显式 correction/低层调用才生成 WorldClaim，因此忘记调用确认入口会导致只有 Episode 级回忆。 |
 | 公共 SDK 稳定性 | 包未发布且 `"private": true`；根导出包含低层 storage/core。升级仓库可能改变非协议 API，外部应用应优先锁定 protocol 1.2 + `MemoryClient`。 |
-| `getSources()` 与 object retrieval trace | 当前授权检查只读取 `kind === "recall"` 的 trace，不读取 `kind === "object_retrieval"`。`retrieveMemory()` 自身会返回 raw content；若要独立展开，使用 staged `recall`。 |
 | 自动温度范围 | 数据模型支持 episode/semantic/object 温度，但 Curator 当前只维护 object。不能假设 Episode 或 WorldClaim 会自动 archive。 |
 | 配置但未执行的质量阈值 | `minimumRecallProxy`、maximum contradiction/stale/orphan/backlog 等部分字段当前只报告或完全未参与动作。设置它们不会自动报警或阻断。 |
 | Object 拓扑全量重建 | `reindex` 重建 FTS/source links/本地信号并可重建 Episode，但不会从零替换现有 object graph；大库 runtime backfill 还有每类 5000 条上限。 |
@@ -1286,4 +1285,4 @@ WHERE m.status = 'active'
 
 **改进公共 API。**
 
-仓库已有较广的单元/集成覆盖，最小示例也能运行，但使用者仍需理解 `submitCorrection` 才能确认事实、在嵌入式模式手动驱动 Curator，并面对“根导出过宽、包未发布、`getSources` 对两种 retrieval trace 授权不一致”等集成摩擦。下一步应只收敛并稳定一个高层 SDK facade：封装 turn 生命周期、条件 checkpoint、显式 fact confirmation、对象检索/来源展开和 embedded worker lifecycle，同时把低层 storage/core 标成非公共。完成该 API 设计并获批之前，不应修改运行时代码。
+仓库已有较广的单元/集成覆盖，最小示例也能运行，但使用者仍需理解 `submitCorrection` 才能确认事实、在嵌入式模式手动驱动 Curator，并面对“根导出过宽、包未发布”等集成摩擦。下一步应只收敛并稳定一个高层 SDK facade：封装 turn 生命周期、条件 checkpoint、显式 fact confirmation、对象检索/来源展开和 embedded worker lifecycle，同时把低层 storage/core 标成非公共。完成该 API 设计并获批之前，不应修改运行时代码。

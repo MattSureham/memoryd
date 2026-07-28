@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { ProtocolError } from "../src/contracts.js";
 import type {
   AgentProfile,
   EpisodeMemory,
@@ -707,6 +708,67 @@ describe("risk-driven evidence retrieval and maintenance safety", () => {
     expect(analysis.riskProfile.inferenceAllowed).toBe(true);
     expect(analysis.riskProfile.retrievalDepth).toBe("object");
     expect(analysis.memories.some((memory) => memory.memoryType === "raw")).toBe(false);
+  });
+
+  it("authorizes source expansion for refs authorized by same-turn object retrieval", async () => {
+    const store = setup();
+    addEpisode(store, {
+      id: "acl",
+      entity: "ProjectAtlas",
+      topic: "codename",
+      content: "The exact ProjectAtlas decision was: codename Aurora.",
+    });
+    const curator = new MemoryCurator(store, { config: { mergeSimilarity: 0.5 } });
+    curator.run(workspaceScope, { type: "scan", idempotencyKey: "acl-ingest" });
+    const runtime = new MemoryRuntime(store);
+
+    const turn = await beginQuery(
+      runtime,
+      "What exactly did we say about the ProjectAtlas codename?",
+      "acl-retrieve",
+    );
+    const result = runtime.retrieveMemory({
+      turnId: turn.turnId,
+      query: "What exactly did we say about the ProjectAtlas codename?",
+    });
+    const evidenceRefs = result.memories.flatMap((memory) => memory.evidenceRefs);
+    expect(evidenceRefs.length).toBeGreaterThan(0);
+
+    const sources = runtime.getSources(turn.turnId, evidenceRefs);
+    expect(sources.some((event) => event.content.includes("codename Aurora"))).toBe(true);
+  });
+
+  it("still denies source expansion for refs not authorized by the requesting turn", async () => {
+    const store = setup();
+    addEpisode(store, {
+      id: "acl-deny",
+      entity: "ProjectAtlas",
+      topic: "codename",
+      content: "The exact ProjectAtlas decision was: codename Aurora.",
+    });
+    const curator = new MemoryCurator(store, { config: { mergeSimilarity: 0.5 } });
+    curator.run(workspaceScope, { type: "scan", idempotencyKey: "acl-deny-ingest" });
+    const runtime = new MemoryRuntime(store);
+
+    const firstTurn = await beginQuery(
+      runtime,
+      "What exactly did we say about the ProjectAtlas codename?",
+      "acl-deny-retrieve",
+    );
+    const result = runtime.retrieveMemory({
+      turnId: firstTurn.turnId,
+      query: "What exactly did we say about the ProjectAtlas codename?",
+    });
+    const evidenceRefs = result.memories.flatMap((memory) => memory.evidenceRefs);
+    expect(evidenceRefs.length).toBeGreaterThan(0);
+
+    const otherTurn = await beginQuery(
+      runtime,
+      "Analyze why ProjectAtlas chose that codename",
+      "acl-deny-other",
+    );
+    expect(() => runtime.getSources(otherTurn.turnId, evidenceRefs))
+      .toThrowError(ProtocolError);
   });
 
   it("abstains from factual reconstruction when no evidence can be resolved", async () => {
