@@ -338,6 +338,10 @@ pnpm bench
 
 协议 JSON Schema 位于 `schemas/memory-protocol-v1.schema.json`。
 
+## 协作协议
+
+参与贡献前请完整阅读 [HANDOFF.md](HANDOFF.md)。它是人类与 Agent 参与者共享的权威当前状态、Issue 清单、证据日志和唯一下一步；每位参与者只更新自己的归属状态，并保留既有记录。
+
 宿主适配依据：[Claude Code memory](https://code.claude.com/docs/en/memory)、[Claude Code hooks](https://code.claude.com/docs/en/hooks-guide)、[Claude Code MCP](https://code.claude.com/docs/en/mcp)、[Codex AGENTS.md](https://learn.chatgpt.com/docs/agent-configuration/agents-md)、[Codex hooks](https://learn.chatgpt.com/docs/hooks)、[Codex MCP](https://learn.chatgpt.com/docs/extend/mcp)。宿主版本升级后，应重新核对生成的配置并运行端到端测试。
 
 ---

@@ -328,6 +328,10 @@ Tests cover protocol, storage, runtime, adapters, learning, retrieval, embedding
 
 The protocol JSON Schema lives at `schemas/memory-protocol-v1.schema.json`.
 
+## Collaboration protocol
+
+Before contributing, read [HANDOFF.md](HANDOFF.md). It is the canonical current state, issue ledger, evidence log, and single next action shared by human and agent participants; update only your attributed state and preserve prior records.
+
 Host adaptation references: [Claude Code memory](https://code.claude.com/docs/en/memory), [Claude Code hooks](https://code.claude.com/docs/en/hooks-guide), [Claude Code MCP](https://code.claude.com/docs/en/mcp), [Codex AGENTS.md](https://learn.chatgpt.com/docs/agent-configuration/agents-md), [Codex hooks](https://learn.chatgpt.com/docs/hooks), [Codex MCP](https://learn.chatgpt.com/docs/extend/mcp). After host version upgrades, re-check the generated configuration and run the end-to-end tests.
 
 ---
