@@ -65,7 +65,7 @@ flowchart TB
 
 ## 设计覆盖与实现状态
 
-以下状态对照 [记忆架构.md](记忆架构.md)、[记忆架构讨论原文.md](记忆架构讨论原文.md) 以及持续增长场景核查当前 `0.1.0` 实现。结论是：**在线控制、证据门控、对象路由和安全学习闭环均已落地；记忆不再依赖一个无限增长的平铺索引，Curator 会增量合并、拆分、重组、降温和归档。学习得到的行为 Policy 仍刻意保留人工审批门。**
+以下状态依据持续增长场景核查当前 `0.1.0` 实现。结论是：**在线控制、证据门控、对象路由和安全学习闭环均已落地；记忆不再依赖一个无限增长的平铺索引，Curator 会增量合并、拆分、重组、降温和归档。学习得到的行为 Policy 仍刻意保留人工审批门。**
 
 ### 已实现
 
@@ -336,7 +336,7 @@ pnpm bench
 
 测试覆盖协议、存储、runtime、适配器、学习、检索、embedding、叙事切块，以及对象聚合、证据追溯、自动/显式 split、质量信号、merge/rename rollback、温度重激活、session ACL、增量回填无饥饿、冲突、Curator 重试、分区重组、v6→v7 migration、导入导出和 forget 级联。benchmark 默认写入 10 万条临时事件并报告 preflight/recall p95，同时显示目标值；目标值不是在所有机器上的性能保证。可用 `MEMORYD_BENCH_EVENTS` 和 `MEMORYD_BENCH_ITERATIONS` 调整规模。
 
-协议 JSON Schema 位于 `schemas/memory-protocol-v1.schema.json`。设计背景见 `记忆架构.md` 与 `记忆架构讨论原文.md`。
+协议 JSON Schema 位于 `schemas/memory-protocol-v1.schema.json`。
 
 宿主适配依据：[Claude Code memory](https://code.claude.com/docs/en/memory)、[Claude Code hooks](https://code.claude.com/docs/en/hooks-guide)、[Claude Code MCP](https://code.claude.com/docs/en/mcp)、[Codex AGENTS.md](https://learn.chatgpt.com/docs/agent-configuration/agents-md)、[Codex hooks](https://learn.chatgpt.com/docs/hooks)、[Codex MCP](https://learn.chatgpt.com/docs/extend/mcp)。宿主版本升级后，应重新核对生成的配置并运行端到端测试。
 

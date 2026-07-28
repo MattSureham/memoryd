@@ -65,7 +65,7 @@ It is not a cloud sync service, a multi-user service, or a universal judge that 
 
 ## Design coverage & implementation status
 
-The following audits `0.1.0` against [记忆架构.md](记忆架构.md), [记忆架构讨论原文.md](记忆架构讨论原文.md), and sustained-growth requirements. Conclusion: **online control, evidence gating, object routing and safe learning are in place; memory no longer depends on one unbounded flat index, and the Curator incrementally merges, splits, reorganizes, cools and archives it. Learned behavioral policies deliberately retain a human approval gate.**
+The following audits `0.1.0` against sustained-growth requirements. Conclusion: **online control, evidence gating, object routing and safe learning are in place; memory no longer depends on one unbounded flat index, and the Curator incrementally merges, splits, reorganizes, cools and archives it. Learned behavioral policies deliberately retain a human approval gate.**
 
 ### Implemented
 
@@ -326,7 +326,7 @@ pnpm bench
 
 Tests cover protocol, storage, runtime, adapters, learning, retrieval, embeddings, narrative chunking, object aggregation/provenance, automatic and explicit split, quality signals, merge/rename rollback, lifecycle reactivation, session ACLs, starvation-free incremental backfill, conflicts, Curator retry, partition reorganization, v6→v7 migration, import/export and forget cascades. The benchmark writes 100k temporary events by default and reports preflight/recall p95 alongside their targets; targets are not performance guarantees on every machine. Tune the scale with `MEMORYD_BENCH_EVENTS` and `MEMORYD_BENCH_ITERATIONS`.
 
-The protocol JSON Schema lives at `schemas/memory-protocol-v1.schema.json`. Design background (in Chinese): `记忆架构.md` and `记忆架构讨论原文.md`.
+The protocol JSON Schema lives at `schemas/memory-protocol-v1.schema.json`.
 
 Host adaptation references: [Claude Code memory](https://code.claude.com/docs/en/memory), [Claude Code hooks](https://code.claude.com/docs/en/hooks-guide), [Claude Code MCP](https://code.claude.com/docs/en/mcp), [Codex AGENTS.md](https://learn.chatgpt.com/docs/agent-configuration/agents-md), [Codex hooks](https://learn.chatgpt.com/docs/hooks), [Codex MCP](https://learn.chatgpt.com/docs/extend/mcp). After host version upgrades, re-check the generated configuration and run the end-to-end tests.
 

@@ -7,3 +7,5 @@ coverage/
 *.db-wal
 *.log
 .DS_Store
+记忆架构.md
+记忆架构讨论原文.md
